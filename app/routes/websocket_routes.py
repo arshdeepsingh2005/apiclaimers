@@ -3,8 +3,11 @@ WebSocket route handlers with username verification.
 """
 import hashlib
 import hmac
+import logging
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 from flask import Blueprint, request
 from flask_socketio import ConnectionRefusedError, disconnect, emit, join_room, leave_room
@@ -59,6 +62,10 @@ def _client_context():
 def _validate_ingest_token(payload: dict) -> bool:
     server_token = Config.INGEST_SHARED_TOKEN
     if not server_token:
+        # API-Claimer: if no ingest token is configured, allow (operator's own
+        # page). Set INGEST_SHARED_TOKEN to require the token index.html sends.
+        if Config.API_CLAIMER_MODE:
+            return True
         emit('error', {'message': 'Ingest token not configured on server'})
         return False
     
@@ -108,6 +115,15 @@ def _handle_code_event(data):
 @socketio.on('connect', namespace='/ws/ingest')
 def handle_ws_ingest_connect():
     """Handle connection to /ws/ingest WebSocket endpoint."""
+    # API-Claimer: the ingest page is the operator's own broadcaster — there is
+    # no per-user validation (no app_users in this DB). Accept the connection
+    # with a synthetic client so the code event can broadcast.
+    if Config.API_CLAIMER_MODE:
+        websocket_manager.add_client(request.sid, 'ws/ingest',
+                                     {'user_id': 'ingest', 'username': 'ingest'})
+        logger.info(f"INGEST connect (api-claimer) sid={request.sid[:12]}")
+        emit('connected', {'message': 'Connected to ingest endpoint'})
+        return
     if not _authorize_connection('ws/ingest'):
         return False
     emit('connected', {'message': 'Connected to ingest endpoint'})
@@ -127,7 +143,18 @@ def handle_ws_ingest_code(data):
         return
 
     if not _validate_ingest_token(data):
+        logger.warning("INGEST code REJECTED (bad/absent ingest token)")
         return
+
+    # Visible receipt log so broadcasts are traceable in the Render logs.
+    try:
+        logger.info(
+            "INGEST code recv | code=%s target_user=%s license=%s couponType=%s value=%s",
+            str(data.get('code'))[:32], data.get('target_username') or '-',
+            data.get('license') or '-', data.get('couponType') or 'drop',
+            data.get('value'))
+    except Exception:
+        pass
 
     # Targeted-USERNAME broadcast: if the operator panel set `target_username`,
     # route ONLY to that user's live /_tmc socket(s), across all licenses, and

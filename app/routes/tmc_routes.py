@@ -932,9 +932,13 @@ def on_user_claim(data):
             slot_tid = 0
         # Log which slot/tg-id/username produced this response so results are
         # attributable at a glance (esp. across 7 slots × 2 RDPs).
+        _vps = r.get('vps') if isinstance(r, dict) else None
+        if _vps is None:
+            _vps = data.get('vps')
         try:
             logger.info(
-                f"API_USERCLAIM | acct={redact_key(license_key)} slot={slot_id} "
+                f"API_USERCLAIM | vps={_vps if _vps is not None else '-'} "
+                f"acct={redact_key(license_key)} slot={slot_id} "
                 f"tg={slot_tid or '-'} user={username} code={str(code)[:32]} "
                 f"claimed={claimed} err={error_code or '-'} cur={currency}"
             )

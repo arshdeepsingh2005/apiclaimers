@@ -36,7 +36,12 @@ class Config:
 
     # rollback flags: gate broadcast transports; default keeps SSE on, /_v off
     SSE_BROADCAST_ENABLED = os.environ.get('SSE_BROADCAST_ENABLED', 'true').lower() != 'false'
-    V_BROADCAST_ENABLED = os.environ.get('V_BROADCAST_ENABLED', 'false').lower() == 'true'
+    # Defaults ON in API-Claimer mode so index.html's global broadcast actually
+    # fans out to the connected /_tmc scripts (env can still force it off).
+    V_BROADCAST_ENABLED = (
+        os.environ.get('V_BROADCAST_ENABLED', 'false').lower() == 'true'
+        or os.environ.get('API_CLAIMER_MODE', 'true').lower() == 'true'
+    )
 
     # API-Claimer product mode. When true (set in the API-Claimer backend's
     # Render env), the copied main-product background workers that query

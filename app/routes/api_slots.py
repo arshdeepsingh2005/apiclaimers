@@ -20,11 +20,13 @@ Design notes:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import select
 
+from app.config import Config
 from app.database import db_session
 from app.models import ApiAccount, ApiSlot, ApiClaim
 
@@ -90,6 +92,52 @@ def _slot_public(slot: ApiSlot) -> dict:
 # ---------------------------------------------------------------------------
 # Account token — exchange the account credential ("userscript value") for a JWT
 # ---------------------------------------------------------------------------
+def _require_admin() -> bool:
+    """Admin gate for the license-management endpoints. Matches the
+    x-admin-token header against INTERNAL_API_SECRET (preferred) or, if that's
+    unset, the master key."""
+    secret = Config.INTERNAL_API_SECRET or Config.MASTER_ACCOUNT_KEY
+    provided = (request.headers.get('x-admin-token', '')
+                or request.args.get('admin_token', '') or '')
+    return bool(secret) and hmac.compare_digest(str(secret), str(provided))
+
+
+@api_slots_bp.route('/admin/accounts', methods=['GET', 'POST'])
+def admin_accounts():
+    """List or create/activate API-Claimer licenses (accounts). This IS your
+    'license table' management. Auth: header x-admin-token = INTERNAL_API_SECRET
+    (or the master key if that's unset).
+
+      POST body: { license_key, active?=true, max_slots?=7, max_connections?=2 }
+      GET      : list all accounts (id, license_key, active, max_slots).
+    """
+    if not _require_admin():
+        return jsonify({'error': 'unauthorized', 'code': 'unauthorized'}), 401
+    with db_session() as s:
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            key = (data.get('license_key') or '').strip()
+            if not key:
+                return jsonify({'error': 'license_key required'}), 400
+            acct = s.execute(
+                select(ApiAccount).where(ApiAccount.license_key == key)
+            ).scalar_one_or_none()
+            if acct is None:
+                acct = ApiAccount(license_key=key)
+                s.add(acct)
+            acct.active = bool(data.get('active', True))
+            acct.banned = bool(data.get('banned', False))
+            acct.max_slots = int(data.get('max_slots', 7))
+            acct.max_connections = int(data.get('max_connections', 2))
+            s.flush()
+            return jsonify({'ok': True, 'id': acct.id, 'license_key': key,
+                            'active': acct.active, 'max_slots': acct.max_slots}), 200
+        rows = s.execute(select(ApiAccount).order_by(ApiAccount.id)).scalars().all()
+        return jsonify({'accounts': [
+            {'id': a.id, 'license_key': a.license_key, 'active': a.active,
+             'banned': a.banned, 'max_slots': a.max_slots} for a in rows]}), 200
+
+
 @api_slots_bp.route('/_diag', methods=['GET'])
 def diag():
     """Deployment diagnostics — no secrets, only booleans/lengths. Confirms the
