@@ -161,14 +161,11 @@ def is_license_active(license_key: str) -> bool:
             return False
         try:
             from app.database import SessionLocal
-            from app.models import ApiAccount
-            from sqlalchemy import select
             with SessionLocal() as session:
-                acct = session.execute(
-                    select(ApiAccount).where(ApiAccount.license_key == license_key)
-                ).scalar_one_or_none()
-                if not acct:
+                acct = resolve_api_account(session, license_key)
+                if acct is None:
                     return False
+                session.commit()   # persist an auto-provisioned master account
                 entry = {
                     'active': bool(acct.active),
                     'banned': bool(acct.banned),
@@ -218,6 +215,31 @@ def is_license_active(license_key: str) -> bool:
     except Exception as exc:
         logger.warning(f"is_license_active DB fallback failed: {exc}")
         return False
+
+
+def resolve_api_account(session, license_key: str):
+    """Return the ApiAccount for `license_key`, AUTO-PROVISIONING the shared
+    master account when license_key == Config.MASTER_ACCOUNT_KEY and no row
+    exists yet. Returns None if it's not the master key and no row exists.
+    Caller owns the transaction (commit)."""
+    from app.models import ApiAccount
+    from sqlalchemy import select
+    acct = session.execute(
+        select(ApiAccount).where(ApiAccount.license_key == license_key)
+    ).scalar_one_or_none()
+    if acct is not None:
+        return acct
+    master = Config.MASTER_ACCOUNT_KEY
+    if master and license_key == master:
+        acct = ApiAccount(
+            license_key=license_key, active=True, banned=False,
+            max_slots=7, max_connections=1000, plan='master',
+        )
+        session.add(acct)
+        session.flush()   # assign acct.id
+        logger.info("resolve_api_account: provisioned shared master account id=%s", acct.id)
+        return acct
+    return None
 
 
 def get_license_cache_entry(license_key: str) -> Optional[dict]:

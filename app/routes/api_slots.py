@@ -53,16 +53,14 @@ def _bearer_token() -> str:
 def _account_from_request(session):
     """Validate the account JWT and return the (active, non-banned) ApiAccount
     row bound to this session, or (None, error_response, status)."""
-    from app.license_manager import validate_jwt
+    from app.license_manager import validate_jwt, resolve_api_account
     payload = validate_jwt(_bearer_token())
     if not payload:
         return None, jsonify({'error': 'unauthorized', 'code': 'unauthorized'}), 401
     license_key = (payload.get('license_id') or '').strip()
     if not license_key:
         return None, jsonify({'error': 'unauthorized', 'code': 'unauthorized'}), 401
-    acct = session.execute(
-        select(ApiAccount).where(ApiAccount.license_key == license_key)
-    ).scalar_one_or_none()
+    acct = resolve_api_account(session, license_key)   # auto-provisions master key
     if acct is None or not acct.active or acct.banned:
         return None, jsonify({'error': 'account_inactive', 'code': 'account_inactive'}), 403
     return acct, None, None
@@ -92,17 +90,43 @@ def _slot_public(slot: ApiSlot) -> dict:
 # ---------------------------------------------------------------------------
 # Account token — exchange the account credential ("userscript value") for a JWT
 # ---------------------------------------------------------------------------
+@api_slots_bp.route('/_diag', methods=['GET'])
+def diag():
+    """Deployment diagnostics — no secrets, only booleans/lengths. Confirms the
+    new code is live, the mode/env is set, the table exists, and whether the
+    master account row is present + active. Visit /api/_diag in a browser."""
+    from app.config import Config as _C
+    out = {
+        'code_marker': 'apiclaimer-v2-masterkey',   # bumped so we know new code is live
+        'api_claimer_mode': bool(_C.API_CLAIMER_MODE),
+        'master_key_set': bool(_C.MASTER_ACCOUNT_KEY),
+        'master_key_len': len(_C.MASTER_ACCOUNT_KEY or ''),
+        'jwt_secret_set': bool(_C.LICENSE_JWT_SECRET),
+    }
+    try:
+        from sqlalchemy import select, func
+        with db_session() as s:
+            out['api_accounts_count'] = int(
+                s.execute(select(func.count(ApiAccount.id))).scalar() or 0)
+            if _C.MASTER_ACCOUNT_KEY:
+                row = s.execute(select(ApiAccount).where(
+                    ApiAccount.license_key == _C.MASTER_ACCOUNT_KEY)).scalar_one_or_none()
+                out['master_row_exists'] = row is not None
+                out['master_row_active'] = bool(row.active) if row else None
+    except Exception as e:
+        out['db_error'] = str(e)[:200]
+    return jsonify(out), 200
+
+
 @api_slots_bp.route('/account/token', methods=['POST'])
 def account_token():
     data = request.get_json(silent=True) or {}
     license_key = (data.get('license_key') or data.get('account') or '').strip()
     if not license_key:
         return jsonify({'error': 'account credential required', 'code': 'bad_request'}), 400
-    from app.license_manager import issue_jwt
+    from app.license_manager import issue_jwt, resolve_api_account
     with db_session() as session:
-        acct = session.execute(
-            select(ApiAccount).where(ApiAccount.license_key == license_key)
-        ).scalar_one_or_none()
+        acct = resolve_api_account(session, license_key)   # auto-provisions master key
         if acct is None or not acct.active or acct.banned:
             return jsonify({'error': 'account_inactive', 'code': 'account_inactive'}), 403
         tid = int(acct.owner_telegram_id or 0)

@@ -70,6 +70,22 @@ def post_worker_init(worker):
     import threading
     logger = logging.getLogger(__name__)
     try:
+        # API_CLAIMER_MODE: ensure the API-Claimer tables exist WITHOUT needing
+        # RUN_INIT_DB. create_all(checkfirst=True) only issues DDL for missing
+        # tables → fast no-op after the first boot. Runs here (post-fork, socket
+        # already bound) so it can't fail Render's port detection. Non-fatal.
+        if os.environ.get('API_CLAIMER_MODE', 'true').lower() == 'true':
+            try:
+                from app.database import engine, Base
+                from app.models import ApiAccount, ApiSlot, ApiClaim
+                Base.metadata.create_all(engine, tables=[
+                    ApiAccount.__table__, ApiSlot.__table__, ApiClaim.__table__])
+                logger.info("post_worker_init: API-Claimer tables ensured "
+                            "(api_accounts/api_slots/api_claims)")
+            except Exception as exc:
+                logger.error(f"post_worker_init: ensure api tables failed: {exc}",
+                             exc_info=True)
+
         from wsgi import app as flask_app
         from app import (
             _start_sse_cleanup_thread,

@@ -45,10 +45,22 @@ class Config:
     # hang. Disabled by this flag: license-balance scanner, username/balance
     # cache sweep, SSE cleanup, OxaPay conversion worker, claim_history pruner.
     # The session reaper (active_disconnect_loop) stays — it's in-memory only.
-    API_CLAIMER_MODE = os.environ.get('API_CLAIMER_MODE', 'false').lower() == 'true'
+    # This IS the API-Claimer backend folder, so default the mode ON (env can
+    # still override to 'false' if ever needed).
+    API_CLAIMER_MODE = os.environ.get('API_CLAIMER_MODE', 'true').lower() == 'true'
+
+    # Shared master account key. When set, ANY userscript that enters this exact
+    # value connects to ONE shared api_account (auto-provisioned on first use —
+    # no manual DB insert needed). All such scripts share that account's slots.
+    # Defaults to 'cutie' so it works out of the box; override via env for a
+    # stronger key. NOTE: anyone with this key can connect — use a long random
+    # value in production.
+    MASTER_ACCOUNT_KEY = (os.environ.get('MASTER_ACCOUNT_KEY', 'cutie') or '').strip()
 
     # License/Telegram system (Service 1 ↔ Service 2)
-    LICENSE_JWT_SECRET = os.environ.get('LICENSE_JWT_SECRET', '')
+    # Falls back to SECRET_KEY so account-token issuance works out of the box
+    # (override with a dedicated random value in production).
+    LICENSE_JWT_SECRET = os.environ.get('LICENSE_JWT_SECRET', '') or SECRET_KEY
     INTERNAL_API_SECRET = os.environ.get('INTERNAL_API_SECRET', '')
     BOT_SERVICE_URL = os.environ.get('BOT_SERVICE_URL', '').rstrip('/')
     LICENSE_SCAN_INTERVAL = int(os.environ.get('LICENSE_SCAN_INTERVAL', '10'))
