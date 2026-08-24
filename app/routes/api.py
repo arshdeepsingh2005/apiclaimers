@@ -919,6 +919,28 @@ def verify_license():
     data = request.get_json(silent=True) or {}
     license_key = (data.get('license_key') or '').strip()
 
+    # API-Claimer: the credential is an api_accounts.license_key (any format).
+    # is_license_active() resolves it from api_accounts and populates the cache.
+    from app.config import Config as _Cfg
+    if _Cfg.API_CLAIMER_MODE:
+        if not license_key:
+            return jsonify({'valid': False, 'code': 'bad_format',
+                            'message': 'Account credential required'}), 400
+        from app.license_manager import is_license_active, get_license_cache_entry
+        ok = is_license_active(license_key)
+        _license_verify_reset_nf(client_ip)
+        entry = get_license_cache_entry(license_key) or {}
+        if not entry:
+            return jsonify({'valid': False, 'code': 'not_found',
+                            'message': 'Account not found'}), 404
+        if entry.get('banned'):
+            return jsonify({'valid': False, 'code': 'banned',
+                            'message': 'Account banned'}), 403
+        if ok:
+            return jsonify({'valid': True, 'active': True}), 200
+        return jsonify({'valid': False, 'code': 'inactive',
+                        'message': 'Account not active'}), 403
+
     if not license_key or not license_key.startswith('THECLAIMERS-'):
         return jsonify({
             'valid': False, 'code': 'bad_format',

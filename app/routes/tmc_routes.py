@@ -742,6 +742,30 @@ def tmc_connect():
         'timestamp': _now_ms(),
     }, request.sid))
 
+    # API-Claimer product: push this account's slots (tokens + config) to the
+    # connecting script so it restores everything from the DB (source of truth)
+    # after a reload / on a fresh RDP. Best-effort — never blocks the connect.
+    if Config.API_CLAIMER_MODE:
+        try:
+            from app.license_manager import get_license_cache_entry
+            from app.routes.api_slots import _slot_public
+            from app.database import SessionLocal
+            from app.models import ApiSlot
+            from sqlalchemy import select
+            _acc_entry = get_license_cache_entry(license_key) or {}
+            _acct_id = _acc_entry.get('account_id')
+            if _acct_id:
+                with SessionLocal() as _s:
+                    _rows = _s.execute(
+                        select(ApiSlot).where(ApiSlot.account_id == int(_acct_id))
+                        .order_by(ApiSlot.slot_index)
+                    ).scalars().all()
+                    _slots = [_slot_public(r) for r in _rows]
+                emit('apiSlots', _wrap({'type': 'apiSlots', 'slots': _slots,
+                                        'timestamp': _now_ms()}, request.sid))
+        except Exception:
+            logger.exception("apiSlots push failed (ignored)")
+
     # Fire connect notification through the debounce layer:
     # suppresses notify on multi-tab additional connects and on reconnects
     # within RECONNECT_NOTIFY_GRACE_S of a recent disconnect.
@@ -891,6 +915,46 @@ def on_user_claim(data):
         )
     except Exception:
         pass
+
+    # API-Claimer product: record the per-SLOT result (claimed-wins) keyed by the
+    # stable backend slot_id carried in the payload, then ACK. This fully bypasses
+    # the main-product license accounting (theclaimers_count, balance deduction,
+    # _add_drop_result, the F-report) — the API-Claimer product has its own
+    # api_claims ledger and (later) its own bot notifications.
+    if Config.API_CLAIMER_MODE:
+        try:
+            slot_id = int(r.get('slot_id') or data.get('slot_id') or 0)
+        except (TypeError, ValueError):
+            slot_id = 0
+        try:
+            slot_tid = int(r.get('slot_telegram_id') or data.get('slot_telegram_id') or 0)
+        except (TypeError, ValueError):
+            slot_tid = 0
+        # Log which slot/tg-id/username produced this response so results are
+        # attributable at a glance (esp. across 7 slots × 2 RDPs).
+        try:
+            logger.info(
+                f"API_USERCLAIM | acct={redact_key(license_key)} slot={slot_id} "
+                f"tg={slot_tid or '-'} user={username} code={str(code)[:32]} "
+                f"claimed={claimed} err={error_code or '-'} cur={currency}"
+            )
+        except Exception:
+            pass
+        if slot_id and code:
+            try:
+                from app.license_manager import get_license_cache_entry
+                from app.routes.api_slots import record_api_claim
+                _e = get_license_cache_entry(license_key) or {}
+                _acct_id = _e.get('account_id')
+                if _acct_id:
+                    record_api_claim(
+                        int(_acct_id), slot_id, code,
+                        claimed=claimed, error_code=(error_code or None),
+                        currency=currency, amount=amount, slot_username=username,
+                    )
+            except Exception:
+                logger.exception("api userClaim record failed (ignored)")
+        return {'ok': True, 'claimed': bool(claimed), 'slot_id': slot_id}
 
     # Server-side dedup — extended with currency so drop+reload of the same
     # code under the same username don't collide.

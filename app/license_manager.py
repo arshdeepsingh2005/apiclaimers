@@ -151,6 +151,41 @@ def is_license_active(license_key: str) -> bool:
         if entry is not None:
             return bool(entry.get('active') and not entry.get('banned'))
 
+    # API-Claimer product: the credential is an api_accounts.license_key (any
+    # format, not the THECLAIMERS- prefix). Resolve it from api_accounts and
+    # cache an account-derived entry. maximum_usernames is set high so the
+    # username-distinct cap never blocks a multi-slot script; account_id +
+    # max_connections are stashed for the connect handler / claim recording.
+    if Config.API_CLAIMER_MODE:
+        if not license_key:
+            return False
+        try:
+            from app.database import SessionLocal
+            from app.models import ApiAccount
+            from sqlalchemy import select
+            with SessionLocal() as session:
+                acct = session.execute(
+                    select(ApiAccount).where(ApiAccount.license_key == license_key)
+                ).scalar_one_or_none()
+                if not acct:
+                    return False
+                entry = {
+                    'active': bool(acct.active),
+                    'banned': bool(acct.banned),
+                    'telegram_id': int(acct.owner_telegram_id or 0),
+                    'maximum_usernames': 1_000_000,   # never block on username-distinct cap
+                    'account_id': int(acct.id),
+                    'max_connections': int(acct.max_connections or 2),
+                    'max_slots': int(acct.max_slots or 7),
+                    'is_api_account': True,
+                }
+                with _cache_lock:
+                    active_license_cache[license_key] = entry
+                return entry['active'] and not entry['banned']
+        except Exception as exc:
+            logger.warning(f"is_license_active (api_account) failed: {exc}")
+            return False
+
     # Cache miss — defensive one-shot DB lookup. Closes the race during the
     # brief window between worker boot and rebuild_cache_from_db() completing,
     # so legitimate clients reconnecting during a backend restart don't get
