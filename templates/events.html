@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code Events</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        .code-event {
+            padding: 10px;
+            margin: 5px 0;
+            background: #252526;
+            border-left: 3px solid #007acc;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h2>Code Events Stream</h2>
+    <div id="events"></div>
+
+    <script>
+        const socket = io('/events');
+        const eventsDiv = document.getElementById('events');
+
+        socket.on('connect', () => {
+            socket.emit('subscribe');
+            addEvent('Connected to events stream');
+        });
+
+        socket.on('new_code', (data) => {
+            addEvent('New code: ' + JSON.stringify(data));
+        });
+
+        socket.on('disconnect', () => {
+            addEvent('Disconnected');
+        });
+
+        function addEvent(message) {
+            const eventDiv = document.createElement('div');
+            eventDiv.className = 'code-event';
+            eventDiv.textContent = new Date().toISOString() + ' - ' + message;
+            eventsDiv.appendChild(eventDiv);
+            eventsDiv.scrollTop = eventsDiv.scrollHeight;
+        }
+    </script>
+</body>
+</html>
+
+
+

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Embed Stream</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            overflow: hidden;
+        }
+    </style>
+</head>
+ <body>
+    <!-- 24/7 hidden iframe connection -->
+    <script>
+        const socket = io('/events', {
+            transports: ['websocket', 'polling'],
+            reconnection: true,
+            reconnectionDelay: 1000,
+            reconnectionAttempts: Infinity
+        });
+
+        socket.on('connect', () => {
+            socket.emit('subscribe');
+            console.log('Embed stream connected');
+        });
+
+        socket.on('new_code', (data) => {
+            // Forward codes to parent window if in iframe
+            if (window.parent !== window) {
+                window.parent.postMessage({
+                    type: 'code_received',
+                    data: data
+                }, '*');
+            }
+        });
+
+        socket.on('disconnect', () => {
+            console.log('Embed stream disconnected');
+        });
+
+        // Keep connection alive
+        setInterval(() => {
+            if (socket.connected) {
+                socket.emit('ping');
+            }
+        }, 30000);
+    </script>
+</body>
+</html>
+
+
+

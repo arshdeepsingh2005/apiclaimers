@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code Server - Login</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 500px;
+            width: 100%;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+        .subtitle {
+            color: #666;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .status {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+            font-weight: 500;
+        }
+        .status.connected {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.disconnected {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.connecting {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        .code-display {
+            background: #f8f9fa;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            padding: 20px;
+            min-height: 100px;
+            margin-top: 20px;
+            font-family: 'Courier New', monospace;
+            word-wrap: break-word;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .code-item {
+            padding: 10px;
+            margin-bottom: 10px;
+            background: white;
+            border-left: 4px solid #667eea;
+            border-radius: 4px;
+        }
+        .code-item:last-child {
+            margin-bottom: 0;
+        }
+        .timestamp {
+            font-size: 12px;
+            color: #999;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Code Server</h1>
+        <p class="subtitle">Direct WebSocket Connection</p>
+        
+        <div id="status" class="status disconnected">
+            Disconnected
+        </div>
+        
+        <div class="code-display" id="codeDisplay">
+            <p style="color: #999; text-align: center;">Waiting for codes...</p>
+        </div>
+    </div>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const codeDisplay = document.getElementById('codeDisplay');
+        let socket;
+        let codes = [];
+
+        function updateStatus(status, message) {
+            statusEl.className = 'status ' + status;
+            statusEl.textContent = message;
+        }
+
+        function connectWebSocket() {
+            updateStatus('connecting', 'Connecting...');
+            
+            // Try connecting to /events namespace first
+            socket = io('/events', {
+                transports: ['websocket', 'polling'],
+                reconnection: true,
+                reconnectionDelay: 1000,
+                reconnectionAttempts: 5
+            });
+
+            socket.on('connect', () => {
+                updateStatus('connected', 'Connected to WebSocket');
+                socket.emit('subscribe');
+            });
+
+            socket.on('connected', (data) => {
+                console.log('Connected:', data);
+            });
+
+            socket.on('new_code', (data) => {
+                console.log('New code received:', data);
+                addCode(data);
+            });
+
+            socket.on('disconnect', () => {
+                updateStatus('disconnected', 'Disconnected');
+            });
+
+            socket.on('connect_error', (error) => {
+                console.error('Connection error:', error);
+                updateStatus('disconnected', 'Connection failed');
+            });
+        }
+
+        function addCode(codeData) {
+            codes.unshift(codeData);
+            if (codes.length > 50) {
+                codes.pop();
+            }
+            renderCodes();
+        }
+
+        function renderCodes() {
+            if (codes.length === 0) {
+                codeDisplay.innerHTML = '<p style="color: #999; text-align: center;">Waiting for codes...</p>';
+                return;
+            }
+
+            codeDisplay.innerHTML = codes.map(code => {
+                const timestamp = code.timestamp || new Date().toISOString();
+                return `
+                    <div class="code-item">
+                        <div><strong>Code:</strong> ${escapeHtml(code.code || JSON.stringify(code))}</div>
+                        ${code.source ? `<div><strong>Source:</strong> ${escapeHtml(code.source)}</div>` : ''}
+                        <div class="timestamp">${new Date(timestamp).toLocaleString()}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Connect on page load
+        connectWebSocket();
+    </script>
+</body>
+</html>
+
+
+
