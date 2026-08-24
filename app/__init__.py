@@ -85,7 +85,10 @@ else:
     async_mode = 'threading'
 
 socketio = SocketIO(
-    cors_allowed_origins=Config.ALLOWED_ORIGINS,
+    # API-Claimer product connects from many origins (Stake mirrors, the
+    # backend's own iframe origin, dashboards) with no Cloudflare in front, so
+    # accept all origins there. The main product keeps its explicit allow-list.
+    cors_allowed_origins=('*' if Config.API_CLAIMER_MODE else Config.ALLOWED_ORIGINS),
     async_mode=async_mode,
     # Engine.IO native ping (server → client). Loosened from the previous
     # 15s/15s (~30s disconnect deadline) to 25s/20s (~45s deadline) to
@@ -114,7 +117,11 @@ def create_app(config_class=Config):
     app = Flask(__name__, template_folder=str(TEMPLATE_DIR))
     app.config.from_object(config_class)
 
-    CORS(app, origins=config_class.ALLOWED_ORIGINS, supports_credentials=True)
+    # API-Claimer: accept all origins (no Cloudflare; many connecting hosts).
+    if config_class.API_CLAIMER_MODE:
+        CORS(app, origins='*', supports_credentials=False)
+    else:
+        CORS(app, origins=config_class.ALLOWED_ORIGINS, supports_credentials=True)
 
     # SocketIO must be bound to the app before run() is used
     socketio.init_app(app)
