@@ -228,6 +228,7 @@ class Config:
         "https://stake3048.com",
         "https://stake3050.com",
         "https://stake3051.com",
+        "https://apiclaimers.onrender.com",
         "https://stake3053.com",
         "https://stake3056.com",
         "https://stake3058.com",
@@ -336,6 +337,7 @@ class Config:
         'code-uksx.onrender.com',
         'https://put-1.onrender.com',
         'https://tanishq-rl44.onrender.com',
+        'https://apiclaimers.onrender.com',
     ]
     # Allow adding relay domains via env (comma-separated)
     _relay_extra = os.environ.get('RELAY_ALLOWED_DOMAINS', '')
