@@ -506,63 +506,91 @@ def order_begin():
                     'stake_username': username}), 200
 
 
-@api_customer_bp.route('/order/allocate', methods=['POST'])
-def order_allocate():
-    """Called by the bot's OxaPay credit worker AFTER payment is verified.
-    Idempotent + payment-integrity gated. Body:
-      {order_id, paid_amount, paid_currency, track_id, status}
-    """
-    if not _require_internal():
-        return _unauth()
-    data = request.get_json(silent=True) or {}
-    order_id = (data.get('order_id') or '').strip()
-    if not order_id:
-        return _bad('order_id required')
-    paid_amount = data.get('paid_amount')
-    paid_currency = (data.get('paid_currency') or Config.OXAPAY_CURRENCY or 'USD').upper()
-    track_id = (data.get('track_id') or '').strip() or None
-    pay_status = (data.get('status') or '').lower()
+def _allocate_order(order_id, track_id=None, pay_status=None,
+                    paid_amount=None, paid_currency=None):
+    """Core allocation — shared by POST /order/allocate and the reconcile sweep.
+    Returns (payload_dict, http_status). Idempotent, payment-integrity gated, and
+    transactional (FOR UPDATE + unique (account,index)). All OxaPay I/O happens
+    OUTSIDE the row lock."""
     now = _now()
+    if pay_status:
+        pay_status = pay_status.lower()
+    verified_by_backend = False
+
+    # Reconcile path: no track_id passed → read the one stored at invoice time.
+    if not track_id:
+        with db_session() as s:
+            row = s.execute(
+                select(ApiOrder.track_id).where(ApiOrder.order_id == order_id)
+            ).first()
+            track_id = (row[0] if row else None)
+
+    # DEFENSE-IN-DEPTH (matches the legacy backend): with our OWN OxaPay key we
+    # INDEPENDENTLY re-verify the invoice (eventlet-safe curl get_payment) and use
+    # THAT as authoritative — never trusting the bot-passed amount/status. No key
+    # configured → fall back to the (internal-token-gated) bot-passed values.
+    if Config.OXAPAY_MERCHANT_KEY and track_id:
+        try:
+            from app import oxapay as _oxa
+            info = _oxa.get_payment(track_id)
+        except Exception:
+            info = {'ok': False}
+        if not info.get('ok'):
+            return {'ok': False, 'code': 'verify_unavailable',
+                    'error': 'could not verify payment, retry'}, 503
+        st = (info.get('status') or '').lower()
+        if st not in _oxa.PAID_STATUSES:
+            return {'ok': False, 'code': 'not_paid',
+                    'error': f'payment status={st or "unknown"}'}, 402
+        pay_status = st
+        verified_by_backend = True
+        if info.get('amount') is not None:
+            paid_amount = info.get('amount')
+        if info.get('currency'):
+            paid_currency = str(info.get('currency')).upper()
+
+    # POSITIVE-PROOF REQUIREMENT: never allocate without evidence of payment. If
+    # the backend did NOT independently verify (no key / no track_id), the caller
+    # (the internal-token-gated bot) MUST assert a paid status — otherwise refuse.
+    # Closes a free-slot path when allocate is called with no payment info.
+    if not verified_by_backend:
+        if not pay_status or pay_status not in ('paid', 'confirmed', 'complete', 'completed'):
+            return {'ok': False, 'code': 'not_paid',
+                    'error': 'no payment proof (backend has no OxaPay key and no paid status supplied)'}, 402
 
     for attempt in range(4):
         try:
+            account_key = None
+            slot_id = None
             with db_session() as s:
                 order = s.execute(
                     select(ApiOrder).where(ApiOrder.order_id == order_id)
                     .with_for_update()
                 ).scalar_one_or_none()
                 if not order:
-                    return jsonify({'ok': False, 'code': 'not_found',
-                                    'error': 'order not found'}), 404
-
-                # Idempotent: already allocated → return the same slot.
+                    return {'ok': False, 'code': 'not_found', 'error': 'order not found'}, 404
                 if order.status == 'allocated':
-                    return jsonify({'ok': True, 'already_allocated': True,
-                                    'slot_id': order.slot_id}), 200
+                    return {'ok': True, 'already_allocated': True, 'slot_id': order.slot_id}, 200
                 if order.status not in ('pending', 'paid'):
-                    return jsonify({'ok': False, 'code': 'bad_state',
-                                    'error': f'order is {order.status}'}), 409
+                    return {'ok': False, 'code': 'bad_state', 'error': f'order is {order.status}'}, 409
 
-                # Payment-integrity gate — the browser can't have changed these.
+                # Payment-integrity gate.
                 if pay_status and pay_status not in ('paid', 'confirmed', 'complete', 'completed'):
-                    return jsonify({'ok': False, 'code': 'not_paid',
-                                    'error': 'payment not confirmed'}), 402
+                    return {'ok': False, 'code': 'not_paid', 'error': 'payment not confirmed'}, 402
                 if paid_amount is not None:
                     try:
                         if float(paid_amount) + 1e-6 < float(order.price_usd):
-                            return jsonify({'ok': False, 'code': 'amount_mismatch',
-                                            'error': 'paid amount below price'}), 402
+                            return {'ok': False, 'code': 'amount_mismatch',
+                                    'error': 'paid amount below price'}, 402
                     except (TypeError, ValueError):
-                        return jsonify({'ok': False, 'code': 'amount_mismatch',
-                                        'error': 'bad paid amount'}), 402
+                        return {'ok': False, 'code': 'amount_mismatch', 'error': 'bad paid amount'}, 402
                 order.status = 'paid'
                 order.track_id = track_id or order.track_id
 
                 token = decrypt_token(order.enc_stake_token)
                 if not token:
                     order.status = 'failed'
-                    return jsonify({'ok': False, 'code': 'token_lost',
-                                    'error': 'pending token unavailable'}), 500
+                    return {'ok': False, 'code': 'token_lost', 'error': 'pending token unavailable'}, 500
 
                 acct, idx = _pick_free(
                     s, now, exclude_order_id=order.order_id,
@@ -572,8 +600,7 @@ def order_allocate():
                 if acct is None:
                     order.status = 'failed'
                     logger.error(f"allocate: NO capacity for paid order {order_id} — refund needed")
-                    return jsonify({'ok': False, 'code': 'no_capacity',
-                                    'error': 'no free slot — refund required'}), 409
+                    return {'ok': False, 'code': 'no_capacity', 'error': 'no free slot — refund required'}, 409
 
                 import json as _json
                 try:
@@ -581,7 +608,6 @@ def order_allocate():
                 except Exception:
                     cfg = {}
 
-                # Reuse an existing (expired/revoked) row at this index, else create.
                 slot = s.execute(
                     select(ApiSlot).where(ApiSlot.account_id == acct.id,
                                           ApiSlot.slot_index == idx)
@@ -623,14 +649,83 @@ def order_allocate():
                 push_slots_to_account(account_key)
             except Exception:
                 logger.exception('push after allocate failed (ignored)')
-            return jsonify({'ok': True, 'slot_id': slot_id}), 200
+            return {'ok': True, 'slot_id': slot_id}, 200
 
         except IntegrityError:
-            # Lost the (account,index) race to another order → retry a new pick.
             logger.warning(f"allocate: index race for order {order_id}, retry {attempt}")
             continue
-    return jsonify({'ok': False, 'code': 'contention',
-                    'error': 'could not allocate, retry'}), 503
+    return {'ok': False, 'code': 'contention', 'error': 'could not allocate, retry'}, 503
+
+
+@api_customer_bp.route('/order/track', methods=['POST'])
+def order_track():
+    """Persist the OxaPay track_id on a pending order at invoice-creation time so
+    the reconcile sweep can recover a MISSED webhook (buyer paid, callback lost)."""
+    if not _require_internal():
+        return _unauth()
+    data = request.get_json(silent=True) or {}
+    order_id = (data.get('order_id') or '').strip()
+    track_id = (data.get('track_id') or '').strip()
+    if not order_id or not track_id:
+        return _bad('order_id and track_id required')
+    with db_session() as s:
+        order = s.execute(
+            select(ApiOrder).where(ApiOrder.order_id == order_id).with_for_update()
+        ).scalar_one_or_none()
+        if not order:
+            return jsonify({'ok': False, 'code': 'not_found'}), 404
+        if order.status == 'pending':
+            order.track_id = track_id
+    return jsonify({'ok': True}), 200
+
+
+@api_customer_bp.route('/order/allocate', methods=['POST'])
+def order_allocate():
+    """Called by the bot's OxaPay credit worker AFTER payment is verified.
+    Idempotent + payment-integrity gated. Body:
+      {order_id, paid_amount, paid_currency, track_id, status}
+    """
+    if not _require_internal():
+        return _unauth()
+    data = request.get_json(silent=True) or {}
+    order_id = (data.get('order_id') or '').strip()
+    if not order_id:
+        return _bad('order_id required')
+    payload, status = _allocate_order(
+        order_id,
+        track_id=(data.get('track_id') or '').strip() or None,
+        pay_status=(data.get('status') or '').lower() or None,
+        paid_amount=data.get('paid_amount'),
+        paid_currency=(data.get('paid_currency') or None))
+    return jsonify(payload), status
+
+
+def reconcile_pending_orders(max_age_min=180):
+    """Recover MISSED OxaPay webhooks: for each pending order that has a stored
+    track_id (invoice was created) and is recent, re-verify with OxaPay and
+    allocate if paid. Backend-side (it holds the OxaPay key) — mirrors the bot's
+    legacy reconcile loop. Only runs when an OxaPay key is configured."""
+    if not Config.OXAPAY_MERCHANT_KEY:
+        return 0
+    now = _now()
+    cutoff = now - timedelta(minutes=max_age_min)
+    with db_session() as s:
+        rows = s.execute(
+            select(ApiOrder.order_id).where(
+                ApiOrder.status == 'pending',
+                ApiOrder.track_id.isnot(None),
+                ApiOrder.created_at >= cutoff)
+            .limit(50)
+        ).scalars().all()
+    done = 0
+    for oid in rows:
+        try:
+            payload, _ = _allocate_order(oid)   # verifies via stored track_id
+            if payload.get('ok'):
+                done += 1
+        except Exception:
+            logger.exception(f"reconcile: order {oid} failed (ignored)")
+    return done
 
 
 @api_customer_bp.route('/order/<order_id>', methods=['GET'])

@@ -540,6 +540,16 @@ def _start_slot_expiry_sweep(app):
                         push_slots_to_account(lk)
                     except Exception:
                         pass
+                # Recover any MISSED OxaPay webhooks: re-verify pending orders that
+                # already have a track_id and allocate if paid (no-op without an
+                # OxaPay key configured on this backend).
+                try:
+                    from app.routes.api_customer import reconcile_pending_orders
+                    n = reconcile_pending_orders()
+                    if n:
+                        logger.info(f"Slot-sweep: reconciled {n} paid order(s) from missed webhooks")
+                except Exception:
+                    logger.exception("slot reconcile failed (ignored)")
             except Exception as e:
                 logger.error(f"Error in slot expiry sweep: {e}", exc_info=True)
                 time.sleep(30)
