@@ -1329,7 +1329,8 @@ def emit_drop_to_license(license_key: str, code: str, coupon_type: str = 'drop',
             delivered = 0
         logger.info(
             f"TMC | DROP code={code[:32]} room={redact_room(room)} "
-            f"delivered={delivered} mode=room"
+            f"value={payload.get('value')} delivered={delivered} mode=room "
+            f"at_ms={int(time.time() * 1000)}"
         )
         return delivered
 
@@ -1402,7 +1403,8 @@ def emit_drop_to_slots(license_key: str, code: str, target_slot_ids, coupon_type
         delivered = 0
     logger.info(
         f"TMC | DROP(slot-scoped) code={code[:32]} room={redact_room(room)} "
-        f"slots={len(payload['target_slot_ids'])} delivered={delivered}"
+        f"value={payload.get('value')} slots={len(payload['target_slot_ids'])} "
+        f"delivered={delivered} at_ms={int(time.time() * 1000)}"
     )
     return delivered
 

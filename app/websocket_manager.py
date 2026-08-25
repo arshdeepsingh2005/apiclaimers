@@ -203,6 +203,11 @@ class WebSocketManager:
                                 'fromTele', base_payload, namespace='/_tmc'
                             )
                             tmc_delivered = -1  # sentinel: namespace-wide
+                            logger.info(
+                                f"TMC | GLOBAL DROP code={code_value[:32]} "
+                                f"value={code_data.get('value')} couponType={base_payload['couponType']} "
+                                f"mode=namespace at_ms={int(time.time() * 1000)}"
+                            )
                         except Exception:
                             pass
                     else:
