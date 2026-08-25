@@ -193,11 +193,12 @@ def handle_ws_ingest_code(data):
         except Exception:
             import logging as _lg
             _lg.getLogger(__name__).exception("F-report schedule failed (ignored)")
-        delivered = emit_drop_to_username(username_target, code_value, coupon_type)
+        delivered = emit_drop_to_username(username_target, code_value, coupon_type,
+                                          value=code_data.get('value'))
         import logging
         logging.getLogger(__name__).info(
             f"BROADCAST | targeted username={username_target} code={code_value} "
-            f"couponType={coupon_type} delivered={delivered}"
+            f"couponType={coupon_type} value={code_data.get('value')} delivered={delivered}"
         )
         return
 
@@ -242,11 +243,12 @@ def handle_ws_ingest_code(data):
         except Exception:
             import logging as _lg
             _lg.getLogger(__name__).exception("F-report schedule failed (ignored)")
-        delivered = emit_drop_to_license(license_target, code_value, coupon_type)
+        delivered = emit_drop_to_license(license_target, code_value, coupon_type,
+                                         value=code_data.get('value'))
         import logging
         logging.getLogger(__name__).info(
             f"BROADCAST | targeted license={license_target} code={code_value} "
-            f"couponType={coupon_type} delivered={delivered}"
+            f"couponType={coupon_type} value={code_data.get('value')} delivered={delivered}"
         )
         return
 

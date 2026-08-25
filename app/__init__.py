@@ -236,6 +236,15 @@ def _start_active_disconnect_worker(app):
 
     logger = logging.getLogger(__name__)
 
+    # API_CLAIMER_MODE: this is a MAIN-PRODUCT reaper that validates connected
+    # clients against the legacy app_users table. In API-Claimer mode the only
+    # non-/_tmc client is the operator's ingest console (username 'ingest'), which
+    # isn't an app_user — so this worker would disconnect it every cycle. Skip it
+    # entirely (userscript account removal is handled by license_deleted events).
+    if Config.API_CLAIMER_MODE:
+        logger.info("Active-Disconnect-Worker NOT started (API_CLAIMER_MODE)")
+        return
+
     def active_disconnect_loop():
         from app.websocket_manager import websocket_manager
         from app.sse_manager import sse_manager

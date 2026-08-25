@@ -1267,7 +1267,21 @@ def push_slots_to_account(license_key: str) -> int:
         return 0
 
 
-def emit_drop_to_license(license_key: str, code: str, coupon_type: str = 'drop') -> int:
+def _resolve_drop_value(code, value):
+    """Apply the /valuefornextcode override (value_override.value_for_code) and
+    return a numeric value for the drop, or None. So the userscript's per-slot
+    min-value filter gets the code's $ value on TARGETED drops too (parity with
+    the global broadcast path)."""
+    try:
+        from app.value_override import value_for_code
+        v = value_for_code(code, value)
+        return v if v is not None else value
+    except Exception:
+        return value
+
+
+def emit_drop_to_license(license_key: str, code: str, coupon_type: str = 'drop',
+                         value=None) -> int:
     """
     Emit 'fromTele' (task=drop) to the license room.
 
@@ -1276,6 +1290,9 @@ def emit_drop_to_license(license_key: str, code: str, coupon_type: str = 'drop')
     `couponType` so it can pick the correct claim path (ClaimConditionBonusCode
     vs ClaimBonusCode). Only 'bonus' is treated specially; any other value is
     normalized to 'drop' to keep the contract strict.
+
+    `value` is the code's $ value — forwarded so the userscript's per-slot
+    min-value filter can compare against each slot's value_filter.
 
     Hybrid fanout:
       RSA off → one room-level emit (Socket.IO engine handles the fanout to
@@ -1299,6 +1316,7 @@ def emit_drop_to_license(license_key: str, code: str, coupon_type: str = 'drop')
         'license': license_key,
         'source': 'telegram',
         'couponType': _ctype,
+        'value': _resolve_drop_value(code, value),
         'timestamp': _now_ms(),
     }
 
@@ -1356,7 +1374,8 @@ def emit_drop_to_license(license_key: str, code: str, coupon_type: str = 'drop')
 # owned+active slots (never client-supplied). The userscript intersects the list
 # with its own _apiSlots as defense-in-depth.
 # ---------------------------------------------------------------------------
-def emit_drop_to_slots(license_key: str, code: str, target_slot_ids, coupon_type: str = 'drop') -> int:
+def emit_drop_to_slots(license_key: str, code: str, target_slot_ids, coupon_type: str = 'drop',
+                       value=None) -> int:
     room = _room(license_key)
     sids = license_sids(license_key)
     if not sids or not target_slot_ids:
@@ -1371,6 +1390,7 @@ def emit_drop_to_slots(license_key: str, code: str, target_slot_ids, coupon_type
         'source': 'telegram',
         'couponType': _ctype,
         'target_slot_ids': [int(s) for s in target_slot_ids],
+        'value': _resolve_drop_value(code, value),
         'timestamp': _now_ms(),
     }
     try:
@@ -1547,7 +1567,8 @@ def tmc_slot_capacity(data=None):
         }
 
 
-def emit_drop_to_username(username: str, code: str, coupon_type: str = 'drop') -> int:
+def emit_drop_to_username(username: str, code: str, coupon_type: str = 'drop',
+                          value=None) -> int:
     """Emit 'fromTele' (task=drop) to EVERY live /_tmc socket whose username
     matches — global scope, across all licenses (mirror of emit_drop_to_license,
     keyed by username). Always per-SID (usernames have no Socket.IO room);
@@ -1562,6 +1583,7 @@ def emit_drop_to_username(username: str, code: str, coupon_type: str = 'drop') -
         # Remember bonus codes so claims for them are excluded from license totals
         # even from old scripts that don't echo couponType back.
         _mark_bonus_code(code)
+    _val = _resolve_drop_value(code, value)
 
     delivered = 0
     for lk, sid, bk_ver in rows:
@@ -1571,6 +1593,7 @@ def emit_drop_to_username(username: str, code: str, coupon_type: str = 'drop') -
             'license': lk,          # this SID's own license (informational for the client)
             'source': 'telegram',
             'couponType': _ctype,
+            'value': _val,
             'timestamp': _now_ms(),
         }
         # Always per-SID (a username has no room; n = one user's tabs, tiny). The

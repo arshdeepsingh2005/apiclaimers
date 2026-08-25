@@ -28,7 +28,7 @@ def _catalog():
         {
             "code": "stream_special",
             "label": "Stream Special",
-            "duration_days": 7,
+            "duration_days": 1,   # 24 hours
             "price_usd": _price(Config.PLAN_PRICE_STREAM_SPECIAL),
             "features": ["Weekly Stream & Secret Codes"],
             "badge": "SPECIAL",
