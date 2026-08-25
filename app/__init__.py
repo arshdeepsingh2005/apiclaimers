@@ -137,6 +137,7 @@ def create_app(config_class=Config):
     from app.routes.websocket_routes import ws_bp
     from app.routes.sse_routes import sse_bp
     from app.routes.api_slots import api_slots_bp  # API-Claimer product
+    from app.routes.api_customer import api_customer_bp  # slot-sales (bot + Mini App)
     # NOTE: the public OxaPay webhook lives on the BOT service (Service 2) now,
     # so the heavy/spammy callback traffic never hits this backend. Money is
     # still moved ONLY here, via the internal /api/xr9k/topup/credit endpoint,
@@ -149,6 +150,7 @@ def create_app(config_class=Config):
     app.register_blueprint(ws_bp)
     app.register_blueprint(sse_bp)
     app.register_blueprint(api_slots_bp)  # API-Claimer product
+    app.register_blueprint(api_customer_bp)  # slot-sales (bot + Mini App)
 
     # Register /_tmc namespace by importing the module (decorators self-register).
     from app.routes import tmc_routes  # noqa: F401
@@ -462,6 +464,89 @@ def _start_active_disconnect_worker(app):
     )
     worker_thread.start()
     logger.info("Active disconnect worker started")
+
+
+# ---------------------------------------------------------------------------
+# Slot-sales sweep (API_CLAIMER_MODE only) — capacity CLEANUP, not the auth
+# boundary. Expires sold slots at/after expires_at (removing them from the
+# operator's userscripts), releases stale unpaid reservations, and securely
+# wipes any lingering pending tokens. Authorization always uses the live
+# expires_at>now() predicate in each request, so this sweep only frees capacity.
+# ---------------------------------------------------------------------------
+def _start_slot_expiry_sweep(app):
+    import threading
+    import time
+    import logging
+    logger = logging.getLogger(__name__)
+
+    def sweep_loop():
+        from app.config import Config
+        from app.database import db_session
+        from app.models import ApiSlot, ApiOrder
+        from sqlalchemy import select, or_
+        interval = max(15, int(getattr(Config, 'SLOT_SWEEP_INTERVAL_S', 60)))
+        while True:
+            try:
+                time.sleep(interval)
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                affected_keys = set()
+                with db_session() as s:
+                    # 1) Expire sold slots whose time is up.
+                    rows = s.execute(
+                        select(ApiSlot).where(ApiSlot.status == 'active',
+                                              ApiSlot.expires_at.isnot(None),
+                                              ApiSlot.expires_at <= now)
+                    ).scalars().all()
+                    for slot in rows:
+                        slot.status = 'expired'
+                    if rows:
+                        from app.models import ApiAccount
+                        acct_ids = {r.account_id for r in rows}
+                        accts = s.execute(
+                            select(ApiAccount).where(ApiAccount.id.in_(acct_ids))
+                        ).scalars().all()
+                        affected_keys = {a.license_key for a in accts}
+                    # 2) Release stale unpaid reservations + wipe their tokens.
+                    stale = s.execute(
+                        select(ApiOrder).where(
+                            ApiOrder.status == 'pending',
+                            ApiOrder.reservation_expires_at.isnot(None),
+                            ApiOrder.reservation_expires_at <= now)
+                    ).scalars().all()
+                    for o in stale:
+                        o.status = 'reservation_expired'
+                        o.enc_stake_token = None
+                        o.reserved_pool_account_id = None
+                        o.reserved_slot_index = None
+                        o.reservation_expires_at = None
+                    # 3) Belt-and-suspenders: wipe tokens on any terminal order.
+                    leftover = s.execute(
+                        select(ApiOrder).where(
+                            ApiOrder.status.in_(('failed', 'refunded', 'reservation_expired')),
+                            ApiOrder.enc_stake_token.isnot(None))
+                    ).scalars().all()
+                    for o in leftover:
+                        o.enc_stake_token = None
+                    if rows or stale or leftover:
+                        logger.info(f"Slot-sweep: expired={len(rows)} "
+                                    f"reservations_released={len(stale)} "
+                                    f"tokens_wiped={len(leftover)}")
+                # Push updated slot lists to affected operator scripts (removes
+                # the expired slot live).
+                for lk in affected_keys:
+                    try:
+                        from app.routes.tmc_routes import push_slots_to_account
+                        push_slots_to_account(lk)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"Error in slot expiry sweep: {e}", exc_info=True)
+                time.sleep(30)
+
+    t = threading.Thread(target=sweep_loop, daemon=True, name="Slot-Expiry-Sweep")
+    t.start()
+    logger.info("Slot expiry sweep worker started (API_CLAIMER_MODE)")
 
 
 # ---------------------------------------------------------------------------

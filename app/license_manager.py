@@ -366,6 +366,16 @@ def license_sids(license_key: str) -> list:
         return list(active_sessions.get(license_key, {}).keys())
 
 
+def all_connected_sids() -> list:
+    """Flat list of every live /_tmc session SID across all licenses. Used to
+    pick any online worker for the token-verify relay."""
+    with _sessions_lock:
+        out = []
+        for bucket in active_sessions.values():
+            out.extend(bucket.keys())
+        return out
+
+
 def sids_for_username(username: str) -> list:
     """Return [(license_key, sid), …] for every live /_tmc session whose username
     matches. GLOBAL scope: spans all licenses. Exact match, consistent with

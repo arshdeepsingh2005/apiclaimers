@@ -77,11 +77,30 @@ def post_worker_init(worker):
         if os.environ.get('API_CLAIMER_MODE', 'true').lower() == 'true':
             try:
                 from app.database import engine, Base
-                from app.models import ApiAccount, ApiSlot, ApiClaim
+                from app.models import ApiAccount, ApiSlot, ApiClaim, ApiOrder
                 Base.metadata.create_all(engine, tables=[
-                    ApiAccount.__table__, ApiSlot.__table__, ApiClaim.__table__])
+                    ApiAccount.__table__, ApiSlot.__table__, ApiClaim.__table__,
+                    ApiOrder.__table__])
+                # create_all only creates MISSING tables; it does NOT add new
+                # columns to an already-existing api_accounts. Add the pool
+                # columns idempotently (Postgres ADD COLUMN IF NOT EXISTS).
+                try:
+                    from sqlalchemy import text as _sql_text
+                    with engine.begin() as _conn:
+                        _conn.execute(_sql_text(
+                            "ALTER TABLE api_accounts "
+                            "ADD COLUMN IF NOT EXISTS is_pool BOOLEAN NOT NULL DEFAULT FALSE"))
+                        _conn.execute(_sql_text(
+                            "ALTER TABLE api_accounts "
+                            "ADD COLUMN IF NOT EXISTS worker_label VARCHAR(40)"))
+                        _conn.execute(_sql_text(
+                            "CREATE INDEX IF NOT EXISTS ix_api_accounts_is_pool "
+                            "ON api_accounts (is_pool)"))
+                except Exception as _mexc:
+                    logger.error(f"post_worker_init: api_accounts column migration "
+                                 f"failed: {_mexc}", exc_info=True)
                 logger.info("post_worker_init: API-Claimer tables ensured "
-                            "(api_accounts/api_slots/api_claims)")
+                            "(api_accounts/api_slots/api_claims/api_orders)")
             except Exception as exc:
                 logger.error(f"post_worker_init: ensure api tables failed: {exc}",
                              exc_info=True)
@@ -92,10 +111,19 @@ def post_worker_init(worker):
             _start_active_disconnect_worker,
             _start_cache_sweep_worker,
             _start_license_activation_scanner,
+            _start_slot_expiry_sweep,
         )
         _start_sse_cleanup_thread()
         _start_active_disconnect_worker(flask_app)
         _start_cache_sweep_worker(flask_app)
+
+        # API_CLAIMER_MODE: slot-sales expiry + reservation sweep (capacity cleanup).
+        if os.environ.get('API_CLAIMER_MODE', 'true').lower() == 'true':
+            try:
+                _start_slot_expiry_sweep(flask_app)
+            except Exception as exc:
+                logger.error(f"post_worker_init: slot expiry sweep start failed: {exc}",
+                             exc_info=True)
 
         # License cache bootstrap + scanner (Phase F)
         try:

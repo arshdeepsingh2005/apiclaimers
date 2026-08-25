@@ -129,41 +129,21 @@ def admin_accounts():
             acct.banned = bool(data.get('banned', False))
             acct.max_slots = int(data.get('max_slots', 7))
             acct.max_connections = int(data.get('max_connections', 2))
+            # Operator sellable-capacity pool + customer-safe worker label.
+            if 'is_pool' in data:
+                acct.is_pool = bool(data.get('is_pool'))
+            if 'worker_label' in data:
+                acct.worker_label = (data.get('worker_label') or None)
             s.flush()
             return jsonify({'ok': True, 'id': acct.id, 'license_key': key,
-                            'active': acct.active, 'max_slots': acct.max_slots}), 200
+                            'active': acct.active, 'max_slots': acct.max_slots,
+                            'is_pool': bool(acct.is_pool),
+                            'worker_label': acct.worker_label}), 200
         rows = s.execute(select(ApiAccount).order_by(ApiAccount.id)).scalars().all()
         return jsonify({'accounts': [
             {'id': a.id, 'license_key': a.license_key, 'active': a.active,
-             'banned': a.banned, 'max_slots': a.max_slots} for a in rows]}), 200
-
-
-@api_slots_bp.route('/_diag', methods=['GET'])
-def diag():
-    """Deployment diagnostics — no secrets, only booleans/lengths. Confirms the
-    new code is live, the mode/env is set, the table exists, and whether the
-    master account row is present + active. Visit /api/_diag in a browser."""
-    from app.config import Config as _C
-    out = {
-        'code_marker': 'apiclaimer-v2-masterkey',   # bumped so we know new code is live
-        'api_claimer_mode': bool(_C.API_CLAIMER_MODE),
-        'master_key_set': bool(_C.MASTER_ACCOUNT_KEY),
-        'master_key_len': len(_C.MASTER_ACCOUNT_KEY or ''),
-        'jwt_secret_set': bool(_C.LICENSE_JWT_SECRET),
-    }
-    try:
-        from sqlalchemy import select, func
-        with db_session() as s:
-            out['api_accounts_count'] = int(
-                s.execute(select(func.count(ApiAccount.id))).scalar() or 0)
-            if _C.MASTER_ACCOUNT_KEY:
-                row = s.execute(select(ApiAccount).where(
-                    ApiAccount.license_key == _C.MASTER_ACCOUNT_KEY)).scalar_one_or_none()
-                out['master_row_exists'] = row is not None
-                out['master_row_active'] = bool(row.active) if row else None
-    except Exception as e:
-        out['db_error'] = str(e)[:200]
-    return jsonify(out), 200
+             'banned': a.banned, 'max_slots': a.max_slots,
+             'is_pool': bool(a.is_pool), 'worker_label': a.worker_label} for a in rows]}), 200
 
 
 @api_slots_bp.route('/account/token', methods=['POST'])
@@ -268,6 +248,15 @@ def upsert_slot():
 
         session.flush()   # assign slot.id
         result = _slot_public(slot)
+        account_key = acct.license_key
+    # Transaction committed → re-push the fresh slot list to every connected
+    # script for this account so a RUNNING userscript hydrates the new/edited
+    # slot and grows its Turnstile pool live (no reconnect needed).
+    try:
+        from app.routes.tmc_routes import push_slots_to_account
+        push_slots_to_account(account_key)
+    except Exception:
+        logger.exception("slot push after upsert failed (ignored)")
     return jsonify({'ok': True, 'slot': result}), 200
 
 
@@ -284,6 +273,14 @@ def delete_slot(slot_id: int):
         if slot is None:
             return jsonify({'error': 'not_found', 'code': 'not_found'}), 404
         session.delete(slot)
+        account_key = acct.license_key
+    # Re-push the remaining slots so running scripts drop the deleted slot and
+    # shrink their Turnstile pool target accordingly (no reconnect needed).
+    try:
+        from app.routes.tmc_routes import push_slots_to_account
+        push_slots_to_account(account_key)
+    except Exception:
+        logger.exception("slot push after delete failed (ignored)")
     return jsonify({'ok': True}), 200
 
 

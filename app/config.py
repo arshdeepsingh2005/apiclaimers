@@ -72,6 +72,28 @@ class Config:
     LICENSE_TOKEN_EXPIRY_SECONDS = int(os.environ.get('LICENSE_TOKEN_EXPIRY_SECONDS', '7200'))
     MAX_CONNECTIONS_PER_LICENSE = int(os.environ.get('MAX_CONNECTIONS_PER_LICENSE', '100'))
 
+    # ── Slot-sales (Telegram bot self-serve) ────────────────────────────────
+    # Server-side key for encrypting the PENDING Stake token in api_orders
+    # (Fernet). Falls back to LICENSE_JWT_SECRET-derived key so it works out of
+    # the box; set a dedicated 32-byte urlsafe-base64 key in production.
+    TOKEN_ENC_KEY = os.environ.get('TOKEN_ENC_KEY', '') or None
+    # Plan prices in USD (entered later — None = "coming soon", not purchasable).
+    PLAN_PRICE_STREAM_SPECIAL = os.environ.get('PLAN_PRICE_STREAM_SPECIAL', '') or None
+    PLAN_PRICE_D7 = os.environ.get('PLAN_PRICE_D7', '') or None
+    PLAN_PRICE_D14 = os.environ.get('PLAN_PRICE_D14', '') or None
+    PLAN_PRICE_D30 = os.environ.get('PLAN_PRICE_D30', '') or None
+    PLAN_PRICE_D90 = os.environ.get('PLAN_PRICE_D90', '') or None
+    # Verify-relay hardening.
+    VERIFY_MAX_TOKEN_LEN = int(os.environ.get('VERIFY_MAX_TOKEN_LEN', '512'))
+    VERIFY_TIMEOUT_S = float(os.environ.get('VERIFY_TIMEOUT_S', '8'))
+    VERIFY_MAX_CONCURRENT = int(os.environ.get('VERIFY_MAX_CONCURRENT', '8'))
+    VERIFY_RATE_PER_MIN = int(os.environ.get('VERIFY_RATE_PER_MIN', '10'))
+    # Unpaid slot reservation hold (seconds) — short + self-expiring so an
+    # abandoned checkout frees the slot for others. Default = OxaPay invoice life.
+    RESERVATION_TTL_S = int(os.environ.get('RESERVATION_TTL_S', str(30 * 60)))
+    # Expiry/reservation sweep cadence (seconds).
+    SLOT_SWEEP_INTERVAL_S = int(os.environ.get('SLOT_SWEEP_INTERVAL_S', '60'))
+
     # Default per-claim deduction rate (%) applied to every NEW license unless
     # explicitly overridden. NULL/After-Claims is the legacy behaviour for
     # pre-existing rows; new rows default to this percentage + zero balance.

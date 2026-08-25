@@ -264,6 +264,12 @@ class ApiAccount(Base):
     max_slots = Column(Integer, nullable=False, default=7)
     # RDP/connection cap (e.g. 2 for premium redundancy).
     max_connections = Column(Integer, nullable=False, default=2)
+    # Operator sellable-capacity pool: when True this account's free slot_indexes
+    # are sold to buyers by the Telegram bot (Σ max_slots of pool accounts = total
+    # capacity). worker_label is the CUSTOMER-SAFE display name (e.g. "Worker 3")
+    # shown in the Mini App — never an RDP name / IP / region.
+    is_pool = Column(Boolean, nullable=False, default=False, index=True)
+    worker_label = Column(String(40), nullable=True)
     plan = Column(String(40), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     activated_at = Column(DateTime(timezone=True), nullable=True)
@@ -355,3 +361,64 @@ class ApiClaim(Base):
     __table_args__ = (
         UniqueConstraint('account_id', 'slot_id', 'code_norm', name='uq_api_claims_acct_slot_code'),
     )
+
+
+class ApiOrder(Base):
+    """
+    A slot PURCHASE order (Telegram bot self-serve flow).
+
+    Lifecycle (state machine — transitions enforced in app/routes/api_customer.py
+    under a row lock, never re-entering a terminal state):
+
+        pending ──pay──> paid ──allocate──> allocated   (terminal)
+        pending ──────────────────────────> failed | reservation_expired
+        paid ─────────────────────────────> refunded
+
+    `allocated` is terminal: `allocate` is idempotent (SELECT ... FOR UPDATE +
+    the unique `slot_id` once set), so two concurrent allocate calls yield
+    EXACTLY ONE ApiSlot / capacity decrement / userscript push; the loser returns
+    the already-assigned slot_id.
+
+    SECURITY — the pending Stake token is held ONLY as an encrypted, short-lived
+    secret in `enc_stake_token` (Fernet/AES-GCM keyed by Config.TOKEN_ENC_KEY). It
+    is written at order/begin, decrypted ONCE inside allocate to move it onto the
+    ApiSlot, then WIPED (set NULL). It is never logged, never returned to the Mini
+    App, never included in GET /order/<id> or any error object, and is
+    secure-deleted whenever the order goes failed/refunded/reservation_expired.
+    price_usd / plan_code / duration_days live ONLY here (server-side) so the
+    browser cannot mutate them after invoice creation.
+
+    Reservation: a buyer with a prior successful payment may hold a
+    (reserved_pool_account_id, reserved_slot_index) with a SHORT self-expiring
+    `reservation_expires_at`. Capacity counts a reservation only while it is
+    unexpired, so an abandoned checkout frees the slot at read time (the sweep
+    then deletes the row + wipes the token). At most one active reservation per
+    telegram_id.
+    """
+
+    __tablename__ = "api_orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(String(64), unique=True, nullable=False, index=True)   # uuid
+    telegram_id = Column(BigInteger, nullable=False, index=True)             # owner (server-derived)
+    plan_code = Column(String(40), nullable=False)
+    price_usd = Column(Float, nullable=False)
+    duration_days = Column(Integer, nullable=False)
+    stake_username = Column(String(64), nullable=True)                       # verified snapshot
+    slot_config = Column(Text, nullable=True)                                # JSON, NON-SECRET only
+
+    # Encrypted pending token — NULL once moved to the slot or securely deleted.
+    enc_stake_token = Column(Text, nullable=True)
+
+    status = Column(String(24), nullable=False, default="pending", index=True)
+    slot_id = Column(Integer, ForeignKey("api_slots.id", ondelete="SET NULL"), nullable=True)
+
+    # Capacity reservation (unpaid hold; self-expiring).
+    reserved_pool_account_id = Column(Integer, ForeignKey("api_accounts.id", ondelete="SET NULL"),
+                                      nullable=True)
+    reserved_slot_index = Column(Integer, nullable=True)
+    reservation_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    track_id = Column(String(80), nullable=True)                             # OxaPay track id
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

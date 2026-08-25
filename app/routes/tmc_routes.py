@@ -26,6 +26,7 @@ from app import socketio
 from app.config import Config
 from app.license_manager import (
     add_session,
+    all_connected_sids,
     can_admit,
     decrypt_payload,
     encrypt_broadcast,
@@ -783,6 +784,12 @@ def tmc_connect():
 @socketio.on('disconnect', namespace=TMC_NS)
 def tmc_disconnect():
     sid = request.sid
+    # Fail any in-flight token-verify waiters that were routed to this worker so
+    # a disconnect can't leave a caller blocked until timeout (point 8 cleanup).
+    try:
+        _fail_verify_waiters_for_sid(sid)
+    except Exception:
+        pass
     rec = remove_session(sid)
     pop_session_key(sid)
     if not rec:
@@ -935,12 +942,16 @@ def on_user_claim(data):
         _vps = r.get('vps') if isinstance(r, dict) else None
         if _vps is None:
             _vps = data.get('vps')
+        _took = (r.get('took_ms') if isinstance(r, dict) else None)
+        if _took is None:
+            _took = data.get('took_ms')
         try:
             logger.info(
                 f"API_USERCLAIM | vps={_vps if _vps is not None else '-'} "
                 f"acct={redact_key(license_key)} slot={slot_id} "
                 f"tg={slot_tid or '-'} user={username} code={str(code)[:32]} "
-                f"claimed={claimed} err={error_code or '-'} cur={currency}"
+                f"claimed={claimed} err={error_code or '-'} cur={currency} "
+                f"took={_took if _took is not None else '-'}ms"
             )
         except Exception:
             pass
@@ -1211,6 +1222,51 @@ def on_broadcast_key_ack(data=None):
 # Outbound helpers (used by /api/xr9k/lic/* internal routes)
 # ---------------------------------------------------------------------------
 
+def push_slots_to_account(license_key: str) -> int:
+    """API-Claimer: re-push the account's current slot list to EVERY connected
+    script for that account (all RDPs) via the license room. Called after a slot
+    is added / edited / deleted (userscript Settings or a bot purchase) so a
+    RUNNING script updates live — hydrates _apiSlots and recomputes its Turnstile
+    pool target — WITHOUT needing a reconnect. Best-effort; returns SID count.
+
+    RSA is off in API_CLAIMER_MODE, so a single room-level emit fans out to every
+    SID (_wrap is an identity passthrough with RSA off). Mirrors the connect-time
+    push in handle_tmc_connect."""
+    if not Config.API_CLAIMER_MODE:
+        return 0
+    try:
+        room = _room(license_key)
+        sids = license_sids(license_key)
+        if not sids:
+            return 0   # nobody connected → next connect's push carries the change
+        from app.license_manager import get_license_cache_entry
+        from app.routes.api_slots import _slot_public
+        from app.database import SessionLocal
+        from app.models import ApiSlot
+        from sqlalchemy import select
+        entry = get_license_cache_entry(license_key) or {}
+        acct_id = entry.get('account_id')
+        if not acct_id:
+            return 0
+        with SessionLocal() as s:
+            rows = s.execute(
+                select(ApiSlot).where(ApiSlot.account_id == int(acct_id))
+                .order_by(ApiSlot.slot_index)
+            ).scalars().all()
+            slots = [_slot_public(r) for r in rows]
+        socketio.emit('apiSlots', {'type': 'apiSlots', 'slots': slots,
+                                   'timestamp': _now_ms()},
+                      room=room, namespace=TMC_NS)
+        logger.info(
+            f"TMC | apiSlots re-push room={redact_room(room)} "
+            f"slots={len(slots)} sids={len(sids)}"
+        )
+        return len(sids)
+    except Exception:
+        logger.exception("push_slots_to_account failed (ignored)")
+        return 0
+
+
 def emit_drop_to_license(license_key: str, code: str, coupon_type: str = 'drop') -> int:
     """
     Emit 'fromTele' (task=drop) to the license room.
@@ -1292,6 +1348,138 @@ def emit_drop_to_license(license_key: str, code: str, coupon_type: str = 'drop')
         f"delivered={delivered} mode=snapshot fanout_ms={_fan_ms:.1f}"
     )
     return delivered
+
+
+# ---------------------------------------------------------------------------
+# Slot-scoped drop — a buyer's code claimed by ONLY their own slot_ids.
+# The target_slot_ids are computed by the backend from the authenticated buyer's
+# owned+active slots (never client-supplied). The userscript intersects the list
+# with its own _apiSlots as defense-in-depth.
+# ---------------------------------------------------------------------------
+def emit_drop_to_slots(license_key: str, code: str, target_slot_ids, coupon_type: str = 'drop') -> int:
+    room = _room(license_key)
+    sids = license_sids(license_key)
+    if not sids or not target_slot_ids:
+        return 0
+    _ctype = 'bonus' if str(coupon_type).strip().lower() == 'bonus' else 'drop'
+    if _ctype == 'bonus':
+        _mark_bonus_code(code)
+    payload = {
+        'task': 'drop',
+        'code': code,
+        'license': license_key,
+        'source': 'telegram',
+        'couponType': _ctype,
+        'target_slot_ids': [int(s) for s in target_slot_ids],
+        'timestamp': _now_ms(),
+    }
+    try:
+        # RSA is off in API_CLAIMER_MODE → a single room-level emit fans out.
+        socketio.emit('fromTele', payload, room=room, namespace=TMC_NS)
+        delivered = len(sids)
+    except Exception as exc:
+        logger.warning(f"emit_drop_to_slots room emit failed: {exc}")
+        delivered = 0
+    logger.info(
+        f"TMC | DROP(slot-scoped) code={code[:32]} room={redact_room(room)} "
+        f"slots={len(payload['target_slot_ids'])} delivered={delivered}"
+    )
+    return delivered
+
+
+# ---------------------------------------------------------------------------
+# Token-verify relay — resolve a Stake username from a pasted API key by asking
+# any online worker (which runs on stake.com, so it can query same-origin) to do
+# it. Hardened per the operator review: bounded pending map, concurrency cap,
+# max token length, hard timeout, ALWAYS-cleanup waiter lifecycle, late/unknown
+# results ignored, disconnect cleanup. The token is used transiently only — never
+# logged, never persisted.
+# ---------------------------------------------------------------------------
+_verify_waiters = {}          # req_id -> {event, sid, result, got, done}
+_verify_lock = threading.Lock()
+
+
+def _fail_verify_waiters_for_sid(sid):
+    """A worker disconnected — release any verify waiters routed to it."""
+    with _verify_lock:
+        for w in _verify_waiters.values():
+            if w.get('sid') == sid and not w.get('done'):
+                w['done'] = True
+                try:
+                    w['event'].send(False)
+                except Exception:
+                    pass
+
+
+def verify_token_via_worker(token: str) -> dict:
+    """→ {'valid':True,'username':..} | {'valid':False,'reason':'invalid'|'unavailable'}.
+    Never logs or persists the token."""
+    import eventlet
+    from eventlet.event import Event
+
+    if not token or len(token) > Config.VERIFY_MAX_TOKEN_LEN:
+        return {'valid': False, 'reason': 'invalid'}
+    sids = all_connected_sids()
+    if not sids:
+        return {'valid': False, 'reason': 'unavailable'}
+
+    with _verify_lock:
+        if len(_verify_waiters) >= Config.VERIFY_MAX_CONCURRENT:
+            return {'valid': False, 'reason': 'unavailable'}
+        req_id = uuid.uuid4().hex
+        target_sid = sids[0]
+        _verify_waiters[req_id] = {
+            'event': Event(), 'sid': target_sid, 'result': None,
+            'got': False, 'done': False,
+        }
+        ev = _verify_waiters[req_id]['event']
+
+    try:
+        socketio.emit('verifyToken', {'req_id': req_id, 'token': token},
+                      to=target_sid, namespace=TMC_NS)
+        with eventlet.Timeout(Config.VERIFY_TIMEOUT_S, False):
+            ev.wait()   # resolved by tmc_verify_token_result, disconnect, or timeout
+        with _verify_lock:
+            w = _verify_waiters.get(req_id) or {}
+            got = w.get('got', False)
+            username = w.get('result')
+        if not got:
+            return {'valid': False, 'reason': 'unavailable'}     # timeout / worker gone
+        if username:
+            return {'valid': True, 'username': username}
+        return {'valid': False, 'reason': 'invalid'}             # worker resolved → no user
+    finally:
+        with _verify_lock:
+            _verify_waiters.pop(req_id, None)                    # ALWAYS remove
+
+
+@socketio.on('verifyTokenResult', namespace=TMC_NS)
+def tmc_verify_token_result(data=None):
+    """Worker's answer to a verifyToken relay. Ignores unknown/late req_ids."""
+    if Config.ENABLE_RSA_AUTH:
+        aes_key = _get_session_aes(request.sid)
+        if aes_key:
+            try:
+                data = decrypt_payload(aes_key, data)
+            except Exception:
+                return
+    if not isinstance(data, dict):
+        return
+    req_id = data.get('req_id')
+    username = data.get('username') or None
+    if isinstance(username, str):
+        username = username.strip()[:64] or None
+    with _verify_lock:
+        w = _verify_waiters.get(req_id)
+        if not w or w.get('done'):
+            return   # unknown or already-resolved/late → ignore safely
+        w['result'] = username
+        w['got'] = True
+        w['done'] = True
+        try:
+            w['event'].send(True)
+        except Exception:
+            pass
 
 
 def emit_drop_to_username(username: str, code: str, coupon_type: str = 'drop') -> int:
