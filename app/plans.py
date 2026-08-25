@@ -32,6 +32,7 @@ def _catalog():
             "price_usd": _price(Config.PLAN_PRICE_STREAM_SPECIAL),
             "features": ["Weekly Stream & Secret Codes"],
             "badge": "SPECIAL",
+            "no_per_day": True,   # special/event plan — don't show a ≈/day rate
         },
         {
             "code": "d7",
@@ -73,10 +74,10 @@ def all_plans():
     out = []
     for p in _catalog():
         q = dict(p)
-        if q["price_usd"] and q["duration_days"]:
+        if q["price_usd"] and q["duration_days"] and not q.get("no_per_day"):
             q["per_day_usd"] = round(q["price_usd"] / q["duration_days"], 2)
         else:
-            q["per_day_usd"] = None
+            q["per_day_usd"] = None   # stream_special (and unpriced) → no ≈/day
         out.append(q)
     return out
 

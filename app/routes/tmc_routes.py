@@ -1482,6 +1482,71 @@ def tmc_verify_token_result(data=None):
             pass
 
 
+# ---------------------------------------------------------------------------
+# Live capacity poll — ask every connected userscript how many of its slots are
+# empty, aggregate over a short window. DISPLAY ONLY: the sale/allocation path
+# does its OWN authoritative DB + live-connection check and never trusts this.
+# ---------------------------------------------------------------------------
+_slotcap_polls = {}          # req_id -> {'replies': {sid: {empty,max,filled}}}
+_slotcap_lock = threading.Lock()
+
+
+def poll_live_capacity(timeout=5.0) -> dict:
+    """Emit getSlotCapacity to all connected workers, collect slotCapacity replies
+    for up to `timeout` seconds, and return {available, workers}. Best-effort."""
+    import eventlet
+    sids = all_connected_sids()
+    if not sids:
+        return {'available': 0, 'workers': 0}
+    req_id = uuid.uuid4().hex
+    with _slotcap_lock:
+        _slotcap_polls[req_id] = {'replies': {}}
+    try:
+        for sid in sids:
+            try:
+                socketio.emit('getSlotCapacity', {'req_id': req_id}, to=sid, namespace=TMC_NS)
+            except Exception:
+                pass
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            eventlet.sleep(0.2)
+            with _slotcap_lock:
+                got = len(_slotcap_polls[req_id]['replies'])
+            if got >= len(sids):
+                break
+        with _slotcap_lock:
+            replies = dict(_slotcap_polls[req_id]['replies'])
+        available = sum(max(0, int(v.get('empty') or 0)) for v in replies.values())
+        return {'available': int(available), 'workers': len(replies)}
+    finally:
+        with _slotcap_lock:
+            _slotcap_polls.pop(req_id, None)
+
+
+@socketio.on('slotCapacity', namespace=TMC_NS)
+def tmc_slot_capacity(data=None):
+    """A worker's reply to getSlotCapacity. Ignores unknown/late req_ids."""
+    if Config.ENABLE_RSA_AUTH:
+        aes_key = _get_session_aes(request.sid)
+        if aes_key:
+            try:
+                data = decrypt_payload(aes_key, data)
+            except Exception:
+                return
+    if not isinstance(data, dict):
+        return
+    req_id = data.get('req_id')
+    with _slotcap_lock:
+        p = _slotcap_polls.get(req_id)
+        if not p:
+            return   # unknown/late → ignore
+        p['replies'][request.sid] = {
+            'empty': int(data.get('empty') or 0),
+            'max': int(data.get('max') or 0),
+            'filled': int(data.get('filled') or 0),
+        }
+
+
 def emit_drop_to_username(username: str, code: str, coupon_type: str = 'drop') -> int:
     """Emit 'fromTele' (task=drop) to EVERY live /_tmc socket whose username
     matches — global scope, across all licenses (mirror of emit_drop_to_license,

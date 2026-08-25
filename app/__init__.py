@@ -491,6 +491,7 @@ def _start_slot_expiry_sweep(app):
                 from datetime import datetime, timezone
                 now = datetime.now(timezone.utc)
                 affected_keys = set()
+                expired_notify = []   # [(telegram_id, stake_username)] for expiry DMs
                 with db_session() as s:
                     # 1) Expire sold slots whose time is up.
                     rows = s.execute(
@@ -500,6 +501,9 @@ def _start_slot_expiry_sweep(app):
                     ).scalars().all()
                     for slot in rows:
                         slot.status = 'expired'
+                        if slot.slot_telegram_id:
+                            expired_notify.append(
+                                (int(slot.slot_telegram_id), slot.stake_username or 'your account'))
                     if rows:
                         from app.models import ApiAccount
                         acct_ids = {r.account_id for r in rows}
@@ -540,6 +544,30 @@ def _start_slot_expiry_sweep(app):
                         push_slots_to_account(lk)
                     except Exception:
                         pass
+                # Notify each affected buyer (and the admin) that their slot expired.
+                if expired_notify:
+                    try:
+                        from app.utils.telegram import notify_bot_service
+                        admin_id = getattr(Config, 'ADMIN_TELEGRAM_ID', None)
+                        for tid, uname in expired_notify:
+                            try:
+                                notify_bot_service(
+                                    tid,
+                                    f"⚠️ Your subscription for <b>{uname}</b> has expired.\n\n"
+                                    f"Recharge and purchase the slot again to keep your Stake "
+                                    f"account claiming <b>24×7</b>.")
+                            except Exception:
+                                pass
+                            if admin_id:
+                                try:
+                                    notify_bot_service(
+                                        int(admin_id),
+                                        f"🔔 Slot expired — user <code>{tid}</code> "
+                                        f"(<b>{uname}</b>). Their subscription ended.")
+                                except Exception:
+                                    pass
+                    except Exception:
+                        logger.exception("expiry notify failed (ignored)")
                 # Recover any MISSED OxaPay webhooks: re-verify pending orders that
                 # already have a track_id and allocate if paid (no-op without an
                 # OxaPay key configured on this backend).

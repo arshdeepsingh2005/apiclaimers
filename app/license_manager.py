@@ -376,6 +376,14 @@ def all_connected_sids() -> list:
         return out
 
 
+def connected_account_keys() -> list:
+    """License keys (accounts) that currently have ≥1 live /_tmc session. This is
+    the sellable pool for the slot product — any connected userscript's account is
+    eligible for allocation."""
+    with _sessions_lock:
+        return [k for k, bucket in active_sessions.items() if bucket]
+
+
 def sids_for_username(username: str) -> list:
     """Return [(license_key, sid), …] for every live /_tmc session whose username
     matches. GLOBAL scope: spans all licenses. Exact match, consistent with

@@ -93,6 +93,9 @@ class Config:
     RESERVATION_TTL_S = int(os.environ.get('RESERVATION_TTL_S', str(30 * 60)))
     # Expiry/reservation sweep cadence (seconds).
     SLOT_SWEEP_INTERVAL_S = int(os.environ.get('SLOT_SWEEP_INTERVAL_S', '60'))
+    # Admin Telegram id — receives slot-expiry / allocation alerts (via the bot
+    # relay). Optional; if unset, only the buyer is notified.
+    ADMIN_TELEGRAM_ID = (os.environ.get('ADMIN_TELEGRAM_ID', '') or '').strip() or None
 
     # Default per-claim deduction rate (%) applied to every NEW license unless
     # explicitly overridden. NULL/After-Claims is the legacy behaviour for

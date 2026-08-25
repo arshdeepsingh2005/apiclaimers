@@ -77,9 +77,17 @@ def _bad(msg, code='bad_request', status=400):
 # Capacity helpers
 # ---------------------------------------------------------------------------
 def _pool_accounts(session):
+    """The sellable pool = accounts with a LIVE userscript connection (active,
+    not banned). This is the ALLOCATION AUTHORITY — computed from the DB + live
+    connection state, never from the display poll. Any connected userscript's
+    account is eligible; no manual is_pool flag required."""
+    from app.license_manager import connected_account_keys
+    keys = connected_account_keys()
+    if not keys:
+        return []
     return session.execute(
         select(ApiAccount).where(
-            ApiAccount.is_pool.is_(True),
+            ApiAccount.license_key.in_(keys),
             ApiAccount.active.is_(True),
             ApiAccount.banned.is_(False),
         ).order_by(ApiAccount.id)
@@ -193,6 +201,29 @@ def _account_online(license_key) -> bool:
         return False
 
 
+# Poll-backed DISPLAY capacity (cached). Never the allocation authority.
+_cap_poll_cache = {'available': None, 'ts': 0.0}
+_CAP_POLL_TTL = 45.0
+
+
+def _get_polled_available() -> int:
+    """Aggregate empty slots reported by connected userscripts (~5s poll), cached
+    ~45s so only the first request after expiry pays the poll latency. Display-only."""
+    global _cap_poll_cache
+    now_t = time.time()
+    if (_cap_poll_cache['available'] is not None
+            and (now_t - _cap_poll_cache['ts']) < _CAP_POLL_TTL):
+        return int(_cap_poll_cache['available'])
+    polled = 0
+    try:
+        from app.routes.tmc_routes import poll_live_capacity
+        polled = int(poll_live_capacity(timeout=5).get('available', 0))
+    except Exception:
+        logger.exception('capacity poll failed (ignored)')
+    _cap_poll_cache = {'available': polled, 'ts': now_t}
+    return polled
+
+
 # ---------------------------------------------------------------------------
 # Verify-token rate limit (per telegram_id, in-memory)
 # ---------------------------------------------------------------------------
@@ -217,9 +248,24 @@ def _verify_rate_ok(tid) -> bool:
 def capacity():
     if not _require_internal():
         return _unauth()
+    now = _now()
+    # DISPLAY number = live poll of connected userscripts (cached ~45s). This is
+    # informational only; it never authorizes an allocation (order/begin +
+    # order/allocate re-check the DB + live connections themselves).
+    polled = _get_polled_available()          # no DB held during the ~5s poll
     with db_session() as s:
-        cap = _capacity(s, _now())
-    return jsonify({'ok': True, **cap, 'plans': all_plans()}), 200
+        reserved = int(s.execute(
+            select(func.count(ApiOrder.id)).where(
+                ApiOrder.status == 'pending',
+                ApiOrder.reservation_expires_at.isnot(None),
+                ApiOrder.reservation_expires_at > now,
+            )
+        ).scalar() or 0)
+        dbcap = _capacity(s, now)             # DB-authoritative (reference)
+    available = max(0, polled - reserved)
+    return jsonify({'ok': True, 'available': available, 'reserved': reserved,
+                    'total': dbcap['total'], 'occupied': dbcap['occupied'],
+                    'plans': all_plans()}), 200
 
 
 @api_customer_bp.route('/verify-token', methods=['POST'])
