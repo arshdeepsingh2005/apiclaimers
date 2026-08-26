@@ -425,21 +425,28 @@ def stats():
             earned[key] = round(float(amt or 0.0), 8)
             successful += int(cnt or 0)
 
-        # Per-USERNAME earnings over the SAME window, so the buyer sees which Stake
-        # account claimed how much (works for 24h/7d/30d — windowed identically to
-        # the overall total). Shape: {username: {currency: amount, ...}, ...}.
+        # Per-USERNAME breakdown over the SAME window — how many codes each Stake
+        # account claimed AND how much it earned (windowed identically to the
+        # overall total; works for 24h/7d/30d). Shape:
+        #   {username: {'claims': N, 'amounts': {currency: amount, ...}}}.
+        # A username is included iff it has >=1 successful CLAIM (not iff amount>0),
+        # so an account that claimed a zero/unknown-amount code still shows its count
+        # ("don't show those who didn't claim").
         by_user_rows = s.execute(
             select(ApiClaim.slot_username, ApiClaim.currency,
-                   func.coalesce(func.sum(ApiClaim.amount), 0.0))
+                   func.coalesce(func.sum(ApiClaim.amount), 0.0),
+                   func.count(ApiClaim.id))
             .where(and_(*base, ApiClaim.claimed.is_(True)))
             .group_by(ApiClaim.slot_username, ApiClaim.currency)
         ).all()
         earned_by_user = {}
-        for uname, cur, amt in by_user_rows:
+        for uname, cur, amt, cnt in by_user_rows:
+            u = earned_by_user.setdefault(uname or '?', {'claims': 0, 'amounts': {}})
+            u['claims'] += int(cnt or 0)
             amt = round(float(amt or 0.0), 8)
-            if amt <= 0:
-                continue
-            earned_by_user.setdefault(uname or '?', {})[(cur or 'unknown').lower()] = amt
+            if amt > 0:
+                u['amounts'][(cur or 'unknown').lower()] = amt
+        earned_by_user = {k: v for k, v in earned_by_user.items() if v['claims'] > 0}
 
         # Recent attempts (last 7 days), DETERMINISTICALLY ordered — the id DESC
         # secondary key means rows with an identical created_at never reorder
