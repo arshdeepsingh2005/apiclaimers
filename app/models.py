@@ -358,6 +358,10 @@ class ApiClaim(Base):
     # buyer of a reused slot from seeing the previous owner's claims. Nullable only
     # for pre-migration rows (which then belong to nobody and are shown to nobody).
     telegram_id = Column(BigInteger, nullable=True, index=True)
+    # Claim KIND — 'drop' | 'bonus' | 'reload'. Lets the Stats dashboard show the
+    # Drops tab (codes) separately from the Reloads tab. Immutable snapshot (never
+    # in the on-conflict SET). Legacy rows are NULL and are treated as drops.
+    claim_type = Column(String(10), nullable=True, index=True)
     code_norm = Column(String(64), nullable=False)
     claimed = Column(Boolean, nullable=False, default=False)
     error_code = Column(String(40), nullable=True)

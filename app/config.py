@@ -87,7 +87,7 @@ class Config:
     VERIFY_MAX_TOKEN_LEN = int(os.environ.get('VERIFY_MAX_TOKEN_LEN', '512'))
     VERIFY_TIMEOUT_S = float(os.environ.get('VERIFY_TIMEOUT_S', '8'))
     VERIFY_MAX_CONCURRENT = int(os.environ.get('VERIFY_MAX_CONCURRENT', '8'))
-    VERIFY_RATE_PER_MIN = int(os.environ.get('VERIFY_RATE_PER_MIN', '10'))
+    VERIFY_RATE_PER_MIN = int(os.environ.get('VERIFY_RATE_PER_MIN', '20'))
     # Unpaid slot reservation hold (seconds) — short + self-expiring so an
     # abandoned checkout frees the slot for others. Default = OxaPay invoice life.
     RESERVATION_TTL_S = int(os.environ.get('RESERVATION_TTL_S', str(30 * 60)))
@@ -96,6 +96,10 @@ class Config:
     # Admin Telegram id — receives slot-expiry / allocation alerts (via the bot
     # relay). Optional; if unset, only the buyer is notified.
     ADMIN_TELEGRAM_ID = (os.environ.get('ADMIN_TELEGRAM_ID', '') or '').strip() or None
+    # Admin bot token — DMs the admin DIRECTLY (code-broadcast + userscript-offline
+    # alerts) via api.telegram.org, independent of the bot-service push. When set,
+    # notify_admin_direct() uses it; unset → those admin alerts are skipped.
+    ADMIN_BOT_TOKEN = (os.environ.get('ADMIN_BOT_TOKEN', '') or '').strip() or None
 
     # Default per-claim deduction rate (%) applied to every NEW license unless
     # explicitly overridden. NULL/After-Claims is the legacy behaviour for

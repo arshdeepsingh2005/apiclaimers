@@ -176,6 +176,13 @@ def _pick_free(session, now, exclude_order_id=None, prefer=None):
 
 def _customer_slot_view(slot, account, online):
     """Customer-safe slot view — NO raw token, only a friendly worker label."""
+    # Live reload status reported by the userscript (None = unknown/stale).
+    rs = None
+    try:
+        from app.routes.tmc_routes import get_slot_reload_status
+        rs = get_slot_reload_status(slot.id)
+    except Exception:
+        rs = None
     return {
         'slot_id': slot.id,
         'stake_username': slot.stake_username,
@@ -190,6 +197,10 @@ def _customer_slot_view(slot, account, online):
         'value_filter': slot.value_filter,
         'worker_label': (account.worker_label if account else None) or 'Worker',
         'online': bool(online),
+        # Reload status for the Mini App (None when unknown).
+        'reload_available': (bool(rs.get('available')) if rs else None),
+        'reload_next_ms': (rs.get('next_claim_ms') if rs else None),
+        'reload_unavailable': bool(rs is not None and not rs.get('available')),
     }
 
 
@@ -277,7 +288,9 @@ def verify_token():
     if not tid:
         return _bad('telegram_id required')
     if not _verify_rate_ok(tid):
-        return jsonify({'ok': False, 'valid': False, 'reason': 'rate_limited'}), 429
+        # Opaque: never surface "rate_limited" — reuse the neutral 'unavailable'
+        # reason (frontend shows a friendly "try again shortly"), status 200.
+        return jsonify({'ok': True, 'valid': False, 'reason': 'unavailable'}), 200
     token = (data.get('token') or '').strip()
     if not token:
         return jsonify({'ok': True, 'valid': False, 'reason': 'invalid'}), 200
@@ -387,7 +400,16 @@ def stats():
         # after their slot expired and its slot_id was reused by a new buyer (the
         # new buyer, in turn, only ever sees claims stamped with their own tid). A
         # reused slot can therefore never leak the previous owner's history.
-        base = [ApiClaim.telegram_id == tid, ApiClaim.created_at >= since]
+        # Per-TYPE split for the Drops vs Reloads tabs. 'drop' includes bonus and
+        # legacy NULL rows (they were code drops); NULL != 'reload' is UNKNOWN in
+        # SQL, so include NULL explicitly. 'reload' is exact. 'all' → no type filter.
+        type_conds = []
+        if ctype == 'drop':
+            type_conds = [or_(ApiClaim.claim_type != 'reload',
+                              ApiClaim.claim_type.is_(None))]
+        elif ctype == 'reload':
+            type_conds = [ApiClaim.claim_type == 'reload']
+        base = [ApiClaim.telegram_id == tid, ApiClaim.created_at >= since, *type_conds]
 
         # Earnings grouped PER CURRENCY (never cross-summed).
         earned_rows = s.execute(
@@ -403,25 +425,55 @@ def stats():
             earned[key] = round(float(amt or 0.0), 8)
             successful += int(cnt or 0)
 
-        # Recent attempts (last 7 days regardless of window filter, capped).
+        # Per-USERNAME earnings over the SAME window, so the buyer sees which Stake
+        # account claimed how much (works for 24h/7d/30d — windowed identically to
+        # the overall total). Shape: {username: {currency: amount, ...}, ...}.
+        by_user_rows = s.execute(
+            select(ApiClaim.slot_username, ApiClaim.currency,
+                   func.coalesce(func.sum(ApiClaim.amount), 0.0))
+            .where(and_(*base, ApiClaim.claimed.is_(True)))
+            .group_by(ApiClaim.slot_username, ApiClaim.currency)
+        ).all()
+        earned_by_user = {}
+        for uname, cur, amt in by_user_rows:
+            amt = round(float(amt or 0.0), 8)
+            if amt <= 0:
+                continue
+            earned_by_user.setdefault(uname or '?', {})[(cur or 'unknown').lower()] = amt
+
+        # Recent attempts (last 7 days), DETERMINISTICALLY ordered — the id DESC
+        # secondary key means rows with an identical created_at never reorder
+        # between requests. Fetch CAP+1 so we can truthfully report truncation
+        # (exactly-CAP is NOT flagged; only a genuine CAP+1th row is).
+        _CAP = 50
         recent = s.execute(
             select(ApiClaim.code_norm, ApiClaim.claimed, ApiClaim.error_code,
-                   ApiClaim.currency, ApiClaim.amount, ApiClaim.created_at)
+                   ApiClaim.currency, ApiClaim.amount, ApiClaim.created_at,
+                   ApiClaim.claim_type, ApiClaim.slot_username)
             .where(ApiClaim.telegram_id == tid,
-                   ApiClaim.created_at >= now - timedelta(days=7))
-            .order_by(ApiClaim.created_at.desc())
-            .limit(100)
+                   ApiClaim.created_at >= now - timedelta(days=7),
+                   *type_conds)
+            .order_by(ApiClaim.created_at.desc(), ApiClaim.id.desc())
+            .limit(_CAP + 1)
         ).all()
+        recent_truncated = len(recent) > _CAP
+        recent = recent[:_CAP]
         recent_codes = [{
-            'code': c, 'claimed': bool(cl),
+            # Reloads use a synthetic key internally — show a clean 'Reload' label.
+            'code': ('Reload' if ct == 'reload' else c),
+            'claimed': bool(cl),
             'result': ('claimed' if cl else (err or 'not claimed')),
             'currency': (cur or None), 'amount': (float(a) if a is not None else None),
             'ts': ts.isoformat() if ts else None,
-        } for (c, cl, err, cur, a, ts) in recent]
+            'type': (ct or 'drop'),
+            'username': (uname or None),
+        } for (c, cl, err, cur, a, ts, ct, uname) in recent]
 
     return jsonify({'ok': True, 'window': window, 'type': ctype,
-                    'earned': earned, 'successful_claims': successful,
-                    'recent_codes': recent_codes}), 200
+                    'earned': earned, 'earned_by_user': earned_by_user,
+                    'successful_claims': successful,
+                    'recent_codes': recent_codes,
+                    'recent_truncated': recent_truncated}), 200
 
 
 @api_customer_bp.route('/drop', methods=['POST'])

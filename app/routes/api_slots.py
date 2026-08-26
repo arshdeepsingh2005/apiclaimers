@@ -317,7 +317,7 @@ def broadcast():
 def record_api_claim(account_id: int, slot_id: int, code_norm: str, *,
                      claimed: bool, error_code: str = None, currency: str = None,
                      amount=None, slot_username: str = None,
-                     telegram_id: int = None) -> None:
+                     telegram_id: int = None, claim_type: str = None) -> None:
     if not account_id or not slot_id or not code_norm:
         return
     from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -334,7 +334,7 @@ def record_api_claim(account_id: int, slot_id: int, code_norm: str, *,
                 ).scalar_one_or_none()
             stmt = pg_insert(ApiClaim.__table__).values(
                 account_id=account_id, slot_id=slot_id, code_norm=code_norm,
-                telegram_id=owner_tid,
+                telegram_id=owner_tid, claim_type=(claim_type or 'drop'),
                 claimed=bool(claimed), error_code=error_code, currency=currency,
                 amount=amount, slot_username=slot_username,
             )

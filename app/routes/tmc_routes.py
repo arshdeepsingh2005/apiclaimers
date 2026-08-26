@@ -291,6 +291,55 @@ def _fmt_connect_msg(username: str, license_key: str) -> str:
     )
 
 
+# ── Admin OFFLINE alert (API-Claimer) ────────────────────────────────────────
+# DM the operator when a userscript disconnects — even if ANOTHER userscript on
+# the same license is still up (unlike the owner-facing debounced notify). Purely
+# a MESSAGE; it never changes any online flag (the disconnect recompute owns that,
+# so a late SID-A disconnect can't create a false "all offline" while SID-B lives).
+# Rate-limited per license to avoid flapping storms.
+OFFLINE_ALERT_COOLDOWN_S = float(os.environ.get('OFFLINE_ALERT_COOLDOWN_S', '30'))
+_offline_alert_last = {}                 # license_key -> last-sent monotonic ts
+_offline_alert_lock = threading.Lock()
+
+
+def _admin_offline_alert(license_key: str, username: str) -> None:
+    """Best-effort admin DM that a userscript went offline. Must be called AFTER
+    remove_session() so `license_sids` reflects the authoritative post-disconnect
+    state. Non-blocking (detached curl); never raises into the caller."""
+    if not Config.API_CLAIMER_MODE or not license_key:
+        return
+    try:
+        now = time.monotonic()
+        with _offline_alert_lock:
+            if now - _offline_alert_last.get(license_key, 0.0) < OFFLINE_ALERT_COOLDOWN_S:
+                return
+            _offline_alert_last[license_key] = now
+            if len(_offline_alert_last) > 10000:      # opportunistic prune
+                cutoff = now - OFFLINE_ALERT_COOLDOWN_S
+                for k in [k for k, v in _offline_alert_last.items() if v < cutoff]:
+                    _offline_alert_last.pop(k, None)
+        try:
+            remaining = len(license_sids(license_key) or [])
+        except Exception:
+            remaining = 0
+        if remaining > 0:
+            msg = (f"⚠️ <b>A userscript went offline</b>\n"
+                   f"🔑 <code>{redact_key(license_key)}</code>\n"
+                   f"👤 {safe_html(username or '-')}\n"
+                   f"🟢 {remaining} still online\n"
+                   f"🕐 {_now_ist()}")
+        else:
+            msg = (f"⚠️ <b>ALL userscripts OFFLINE</b>\n"
+                   f"🔑 <code>{redact_key(license_key)}</code>\n"
+                   f"👤 {safe_html(username or '-')}\n"
+                   f"Turn one on ASAP!\n"
+                   f"🕐 {_now_ist()}")
+        from app.utils.telegram import notify_admin_direct
+        notify_admin_direct(msg)
+    except Exception:
+        logger.exception("admin offline alert failed (ignored)")
+
+
 def _fmt_disconnect_msg(username: str, license_key: str, duration_s: int) -> str:
     # Mirror layout of connect, with session length surfaced prominently
     # (operators usually care: "did they leave quickly or stick around?").
@@ -830,6 +879,14 @@ def tmc_disconnect():
     except Exception:
         pass
 
+    # API-Claimer: admin OFFLINE alert — fires on EVERY userscript disconnect
+    # (even if another is still up), rate-limited per license. Runs after
+    # remove_session() above so the remaining-session count is authoritative.
+    try:
+        _admin_offline_alert(license_key, username)
+    except Exception:
+        pass
+
     logger.info(
         f"TMC | DISCONNECT sid={sid[:12]} user={safe_html(username)[:32]} "
         f"room={redact_room(_room(license_key))} duration={duration_s}s"
@@ -955,21 +1012,31 @@ def on_user_claim(data):
             )
         except Exception:
             pass
-        if slot_id and code:
-            try:
-                from app.license_manager import get_license_cache_entry
-                from app.routes.api_slots import record_api_claim
-                _e = get_license_cache_entry(license_key) or {}
-                _acct_id = _e.get('account_id')
-                if _acct_id:
-                    record_api_claim(
-                        int(_acct_id), slot_id, code,
-                        claimed=claimed, error_code=(error_code or None),
-                        currency=currency, amount=amount, slot_username=username,
-                        telegram_id=(slot_tid or None),
-                    )
-            except Exception:
-                logger.exception("api userClaim record failed (ignored)")
+        if slot_id:
+            # Claim KIND for the Stats Drops/Reloads split.
+            _is_bonus = (data.get('couponType') or 'drop').strip().lower() == 'bonus'
+            _claim_type = 'reload' if task_type == 'reload' else ('bonus' if _is_bonus else 'drop')
+            # Reloads carry no code — synthesize a UNIQUE one (ms precision) so each
+            # reload becomes its own ledger row (correct history + earnings) instead
+            # of colliding on the (account, slot, code) key.
+            _rec_code = code
+            if _claim_type == 'reload' and not _rec_code:
+                _rec_code = f"rl:{(currency or 'usdt')}:{int(time.time() * 1000)}"
+            if _rec_code:
+                try:
+                    from app.license_manager import get_license_cache_entry
+                    from app.routes.api_slots import record_api_claim
+                    _e = get_license_cache_entry(license_key) or {}
+                    _acct_id = _e.get('account_id')
+                    if _acct_id:
+                        record_api_claim(
+                            int(_acct_id), slot_id, _rec_code,
+                            claimed=claimed, error_code=(error_code or None),
+                            currency=currency, amount=amount, slot_username=username,
+                            telegram_id=(slot_tid or None), claim_type=_claim_type,
+                        )
+                except Exception:
+                    logger.exception("api userClaim record failed (ignored)")
         return {'ok': True, 'claimed': bool(claimed), 'slot_id': slot_id}
 
     # Server-side dedup — extended with currency so drop+reload of the same
@@ -1217,6 +1284,82 @@ def on_broadcast_key_ack(data=None):
             emit(_EV_BK_DELIVER, env)
         return
     mark_session_bk_version(sid, cur_ver)
+
+
+# ---------------------------------------------------------------------------
+# Per-slot RELOAD STATUS — fed by the userscript, read by the Mini App.
+#   slot_id -> {available, next_claim_ms, currency, amount, ts}
+# When a slot's account has no active reload faucet (available=False) and the
+# slot has auto_reload ON, we turn it OFF and re-push so the app + script stop.
+# ---------------------------------------------------------------------------
+_slot_reload_status = {}
+_SLOT_RELOAD_STATUS_TTL = 900   # 15 min; older entries are treated as unknown
+
+
+def get_slot_reload_status(slot_id):
+    """Fresh reload status for a slot, or None if unknown/stale."""
+    try:
+        e = _slot_reload_status.get(int(slot_id))
+    except (TypeError, ValueError):
+        return None
+    if not e:
+        return None
+    if (time.time() - e.get('ts', 0)) > _SLOT_RELOAD_STATUS_TTL:
+        return None
+    return e
+
+
+@socketio.on('slotReloadStatus', namespace=TMC_NS)
+def on_slot_reload_status(data):
+    """Userscript reports a slot's reload availability + next-reload time. Cache it
+    for the Mini App; if the account has NO reload faucet, auto-disable auto_reload."""
+    if not Config.API_CLAIMER_MODE:
+        return
+    session_info = get_session_by_sid(request.sid)
+    if not session_info or not isinstance(data, dict):
+        return
+    license_key = session_info['license_key']
+    try:
+        slot_id = int(data.get('slot_id') or 0)
+    except (TypeError, ValueError):
+        slot_id = 0
+    if not slot_id:
+        return
+    available = bool(data.get('available'))
+    try:
+        next_ms = int(data.get('next_claim_ms')) if data.get('next_claim_ms') is not None else None
+    except (TypeError, ValueError):
+        next_ms = None
+    currency = (str(data.get('currency') or '').strip().lower() or None)
+    amount = data.get('amount')
+
+    from app.license_manager import get_license_cache_entry
+    acct_id = (get_license_cache_entry(license_key) or {}).get('account_id')
+    if not acct_id:
+        return
+    auto_off = False
+    try:
+        from app.database import db_session
+        from app.models import ApiSlot
+        with db_session() as s:
+            slot = s.get(ApiSlot, slot_id)
+            if not slot or slot.account_id != int(acct_id):
+                return   # not this account's slot — ignore (defense in depth)
+            _slot_reload_status[slot_id] = {
+                'available': available, 'next_claim_ms': next_ms,
+                'currency': currency, 'amount': amount, 'ts': time.time(),
+            }
+            if (not available) and slot.auto_reload:
+                slot.auto_reload = False
+                auto_off = True
+    except Exception:
+        logger.exception("slotReloadStatus handler failed (ignored)")
+        return
+    if auto_off:
+        try:
+            push_slots_to_account(license_key)   # stops the cycle + refreshes the app
+        except Exception:
+            logger.exception("push after reload auto-off failed (ignored)")
 
 
 # ---------------------------------------------------------------------------

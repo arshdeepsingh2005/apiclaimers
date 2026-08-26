@@ -91,6 +91,52 @@ def _queue_message(text: str, parse_mode: str = "HTML", reply_markup: dict = Non
     _send_telegram(payload)
 
 
+def _send_admin(payload: dict) -> bool:
+    """Detached-curl send to the OPERATOR's admin bot (ADMIN_BOT_TOKEN) →
+    ADMIN_TELEGRAM_ID. Same fork+exec discipline as `_send_telegram`: returns in
+    ~1–5 ms, never waits on the network, never holds a lock. Returns True if a
+    send was dispatched, False if creds are missing or the spawn failed."""
+    token = os.environ.get("ADMIN_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("ADMIN_TELEGRAM_ID", "").strip()
+    if not token or not chat_id:
+        return False
+    body = dict(payload)
+    body["chat_id"] = chat_id
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        subprocess.Popen(
+            [
+                "curl", "--silent", "--show-error",
+                "--max-time", "15", "--connect-timeout", "10",
+                "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", json.dumps(body),
+                "-o", "/dev/null",
+                url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return True
+    except Exception as e:
+        logger.error(f"notify_admin_direct: curl spawn failed — {e}")
+        return False
+
+
+def notify_admin_direct(message_html: str) -> bool:
+    """DM the admin directly via ADMIN_BOT_TOKEN → ADMIN_TELEGRAM_ID (detached
+    curl; non-blocking, best-effort, never raises). No-op (False) if either env
+    var is unset."""
+    if not message_html:
+        return False
+    if len(message_html) > 4096:
+        message_html = message_html[:4090] + "\n…"
+    return _send_admin({"text": message_html, "parse_mode": "HTML"})
+
+
 def notify_startup() -> None:
     _queue_message("Restarted....")
 
@@ -277,6 +323,9 @@ def notify_broadcast(code: str, broadcast_epoch: float = None, source: str = Non
         if not admin_id:
             logger.warning("notify_broadcast: ADMIN_TELEGRAM_ID not set; admin alert skipped")
             return
-        notify_bot_service(int(admin_id), message)
+        # Prefer the operator's OWN bot (ADMIN_BOT_TOKEN, direct DM) when set;
+        # otherwise fall back to the bot-service push. Exactly one delivery.
+        if not notify_admin_direct(message):
+            notify_bot_service(int(admin_id), message)
     except Exception as e:
         logger.warning(f"notify_broadcast: {e}")

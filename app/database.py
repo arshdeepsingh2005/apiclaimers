@@ -386,13 +386,16 @@ def ensure_api_claim_columns() -> None:
         "ALTER TABLE api_claims ADD COLUMN IF NOT EXISTS telegram_id BIGINT",
         "CREATE INDEX IF NOT EXISTS ix_api_claims_telegram_id "
         "ON api_claims (telegram_id)",
+        "ALTER TABLE api_claims ADD COLUMN IF NOT EXISTS claim_type VARCHAR(10)",
+        "CREATE INDEX IF NOT EXISTS ix_api_claims_claim_type "
+        "ON api_claims (claim_type)",
     )
     try:
         with engine.begin() as conn:
             for stmt in statements:
                 conn.execute(text(stmt))
         logging.getLogger(__name__).info(
-            "ensure_api_claim_columns: api_claims.telegram_id ensured"
+            "ensure_api_claim_columns: api_claims.telegram_id + claim_type ensured"
         )
     except Exception as e:
         logging.getLogger(__name__).warning(
