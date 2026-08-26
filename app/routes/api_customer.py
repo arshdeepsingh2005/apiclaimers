@@ -381,17 +381,13 @@ def stats():
              '30d': now - timedelta(days=30)}.get(window, now - timedelta(hours=24))
 
     with db_session() as s:
-        slot_ids = s.execute(
-            select(ApiSlot.id).where(ApiSlot.slot_telegram_id == tid)
-        ).scalars().all()
-        if not slot_ids:
-            return jsonify({'ok': True, 'window': window, 'earned': {},
-                            'successful_claims': 0, 'recent_codes': []}), 200
-
-        # Type filter maps to the recorded currency semantics we have: reload vs
-        # drop is carried on the claim via error_code/currency context; we filter
-        # by couponType-equivalent when present, else include all.
-        base = [ApiClaim.slot_id.in_(slot_ids), ApiClaim.created_at >= since]
+        # Scope by the IMMUTABLE per-claim ownership snapshot (telegram_id), NOT by
+        # currently-owned slot_ids. This is the privacy boundary AND the retention
+        # guarantee: a buyer sees exactly THEIR OWN claims for the full window even
+        # after their slot expired and its slot_id was reused by a new buyer (the
+        # new buyer, in turn, only ever sees claims stamped with their own tid). A
+        # reused slot can therefore never leak the previous owner's history.
+        base = [ApiClaim.telegram_id == tid, ApiClaim.created_at >= since]
 
         # Earnings grouped PER CURRENCY (never cross-summed).
         earned_rows = s.execute(
@@ -411,7 +407,7 @@ def stats():
         recent = s.execute(
             select(ApiClaim.code_norm, ApiClaim.claimed, ApiClaim.error_code,
                    ApiClaim.currency, ApiClaim.amount, ApiClaim.created_at)
-            .where(ApiClaim.slot_id.in_(slot_ids),
+            .where(ApiClaim.telegram_id == tid,
                    ApiClaim.created_at >= now - timedelta(days=7))
             .order_by(ApiClaim.created_at.desc())
             .limit(100)

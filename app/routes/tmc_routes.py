@@ -966,6 +966,7 @@ def on_user_claim(data):
                         int(_acct_id), slot_id, code,
                         claimed=claimed, error_code=(error_code or None),
                         currency=currency, amount=amount, slot_username=username,
+                        telegram_id=(slot_tid or None),
                     )
             except Exception:
                 logger.exception("api userClaim record failed (ignored)")

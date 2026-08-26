@@ -349,6 +349,15 @@ class ApiClaim(Base):
                         nullable=False, index=True)
     slot_id = Column(Integer, ForeignKey("api_slots.id", ondelete="CASCADE"),
                      nullable=False, index=True)
+    # IMMUTABLE ownership snapshot: the Telegram ID that OWNED this slot at the
+    # moment of the claim. Unlike ApiSlot.slot_telegram_id (which is REASSIGNED
+    # when an expired slot's row is reused by a new buyer), this is written once
+    # and never changed — so a buyer's history stays bound to THEM even after the
+    # physical slot_id is handed to someone else. Customer-facing stats are scoped
+    # by this column (never by the reusable slot_id), which is what prevents a new
+    # buyer of a reused slot from seeing the previous owner's claims. Nullable only
+    # for pre-migration rows (which then belong to nobody and are shown to nobody).
+    telegram_id = Column(BigInteger, nullable=True, index=True)
     code_norm = Column(String(64), nullable=False)
     claimed = Column(Boolean, nullable=False, default=False)
     error_code = Column(String(40), nullable=True)

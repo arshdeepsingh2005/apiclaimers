@@ -8,7 +8,7 @@ from flask_cors import CORS
 from flask_socketio import SocketIO
 
 from app.config import Config
-from app.database import SessionLocal, init_db, init_claims_db
+from app.database import SessionLocal, init_db, init_claims_db, ensure_api_claim_columns
 from app.models import User
 from app.services import user_service
 from sqlalchemy import func, select
@@ -183,6 +183,12 @@ def create_app(config_class=Config):
                 # CLAIMS_DATABASE_URL unset; never raises — degrades to the
                 # in-memory fallback rather than blocking boot).
                 init_claims_db()
+            # Self-heal the api_claims ownership-snapshot column on EVERY boot in
+            # API_CLAIMER_MODE (idempotent ADD COLUMN IF NOT EXISTS) so an existing
+            # DB gets it without a manual migration / RUN_INIT_DB re-run. Cheap and
+            # non-fatal; needed before /stats or any claim recording runs.
+            if Config.API_CLAIMER_MODE:
+                ensure_api_claim_columns()
             user_service.start()
     except Exception as e:
         logging.error(
@@ -513,6 +519,22 @@ def _start_slot_expiry_sweep(app):
                         if slot.slot_telegram_id:
                             expired_notify.append(
                                 (int(slot.slot_telegram_id), slot.stake_username or 'your account'))
+                    # Token hygiene: once a subscription ends we no longer need the
+                    # buyer's raw Stake credential. Wipe it on EVERY expired slot
+                    # that still carries one (covers this cycle's expirations AND
+                    # any historically-expired rows) so a dead subscription never
+                    # leaves a live Stake token sitting in the DB / pushed to scripts.
+                    # The userscript already ignores non-active slots, and a reuse
+                    # overwrites the token anyway — so this is pure defense-in-depth.
+                    from sqlalchemy import update as _update
+                    s.flush()
+                    tok_wiped = s.execute(
+                        _update(ApiSlot)
+                        .where(ApiSlot.status == 'expired',
+                               ApiSlot.stake_access_token.isnot(None))
+                        .values(stake_access_token=None, token_fp=None,
+                                token_valid=False)
+                    ).rowcount
                     if rows:
                         from app.models import ApiAccount
                         acct_ids = {r.account_id for r in rows}
@@ -541,10 +563,11 @@ def _start_slot_expiry_sweep(app):
                     ).scalars().all()
                     for o in leftover:
                         o.enc_stake_token = None
-                    if rows or stale or leftover:
+                    if rows or stale or leftover or tok_wiped:
                         logger.info(f"Slot-sweep: expired={len(rows)} "
                                     f"reservations_released={len(stale)} "
-                                    f"tokens_wiped={len(leftover)}")
+                                    f"order_tokens_wiped={len(leftover)} "
+                                    f"slot_tokens_wiped={tok_wiped}")
                 # Push updated slot lists to affected operator scripts (removes
                 # the expired slot live).
                 for lk in affected_keys:

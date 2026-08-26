@@ -316,18 +316,31 @@ def broadcast():
 # ---------------------------------------------------------------------------
 def record_api_claim(account_id: int, slot_id: int, code_norm: str, *,
                      claimed: bool, error_code: str = None, currency: str = None,
-                     amount=None, slot_username: str = None) -> None:
+                     amount=None, slot_username: str = None,
+                     telegram_id: int = None) -> None:
     if not account_id or not slot_id or not code_norm:
         return
     from sqlalchemy.dialects.postgresql import insert as pg_insert
     try:
         with db_session() as session:
+            # Resolve the OWNER authoritatively from the slot row (never trust the
+            # userscript payload). This becomes the immutable ownership snapshot on
+            # the claim, so customer stats can be scoped to the buyer who actually
+            # owned the slot at claim time — even after the slot_id is later reused.
+            owner_tid = telegram_id
+            if not owner_tid:
+                owner_tid = session.execute(
+                    select(ApiSlot.slot_telegram_id).where(ApiSlot.id == slot_id)
+                ).scalar_one_or_none()
             stmt = pg_insert(ApiClaim.__table__).values(
                 account_id=account_id, slot_id=slot_id, code_norm=code_norm,
+                telegram_id=owner_tid,
                 claimed=bool(claimed), error_code=error_code, currency=currency,
                 amount=amount, slot_username=slot_username,
             )
             # Upgrade to claimed only (never downgrade); refresh metadata on upgrade.
+            # telegram_id is DELIBERATELY absent from set_ — the ownership snapshot
+            # is immutable once written (one-time codes never collide across owners).
             stmt = stmt.on_conflict_do_update(
                 index_elements=['account_id', 'slot_id', 'code_norm'],
                 set_={

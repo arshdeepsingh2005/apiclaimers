@@ -362,6 +362,44 @@ def ensure_claimer_apis_table() -> None:
         )
 
 
+def ensure_api_claim_columns() -> None:
+    """
+    Idempotently ensure the immutable ownership-snapshot column exists on
+    `api_claims`.
+
+    `Base.metadata.create_all()` only CREATEs missing tables — it never ALTERs an
+    existing one — so an `api_claims` table that predates this column needs an
+    explicit `ADD COLUMN IF NOT EXISTS`. `telegram_id` is the Telegram ID that
+    OWNED the slot at claim time; customer stats are scoped by it so a reused slot
+    can never leak the previous owner's history (see ApiClaim / record_api_claim).
+
+    Best-effort and idempotent; a failure here must never crash startup. Skipped
+    on non-Postgres (SQLite dev builds the column from the model via create_all).
+    Pre-existing rows keep telegram_id NULL — they belong to nobody and are shown
+    to nobody, which is the safe default.
+    """
+    if not DATABASE_URL or not DATABASE_URL.startswith("postgresql"):
+        return
+    import logging
+    from sqlalchemy import text
+    statements = (
+        "ALTER TABLE api_claims ADD COLUMN IF NOT EXISTS telegram_id BIGINT",
+        "CREATE INDEX IF NOT EXISTS ix_api_claims_telegram_id "
+        "ON api_claims (telegram_id)",
+    )
+    try:
+        with engine.begin() as conn:
+            for stmt in statements:
+                conn.execute(text(stmt))
+        logging.getLogger(__name__).info(
+            "ensure_api_claim_columns: api_claims.telegram_id ensured"
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"ensure_api_claim_columns failed (non-fatal): {e}"
+        )
+
+
 @contextmanager
 def db_session() -> Generator:
     """
