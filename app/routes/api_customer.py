@@ -18,7 +18,9 @@ Trust model (operator security review):
 from __future__ import annotations
 
 import hmac
+import itertools
 import logging
+import os
 import time
 import uuid
 from collections import defaultdict, deque
@@ -37,6 +39,25 @@ from app.token_crypto import decrypt_token, encrypt_token
 logger = logging.getLogger(__name__)
 
 api_customer_bp = Blueprint('api_customer', __name__, url_prefix='/api/cust')
+
+# --- Temporary / low-rate-sampled /stats latency instrumentation --------------
+# Set STATS_TIMING_EVERY=N (>0) to log a per-stage BACKEND timing breakdown on
+# every Nth /stats request while capturing a production baseline, then UNSET it.
+# Default 0 = OFF, so there is ZERO logging overhead on the hot path in normal
+# operation (logging every request would itself add latency at customer scale).
+# This is diagnostic scaffolding, not permanent per-request logging.
+try:
+    _STATS_TIMING_EVERY = max(0, int(os.environ.get('STATS_TIMING_EVERY', '0') or '0'))
+except Exception:
+    _STATS_TIMING_EVERY = 0
+_stats_req_counter = itertools.count(1)
+
+
+def _stats_should_sample() -> bool:
+    """True on every Nth call when STATS_TIMING_EVERY>0; always False when disabled."""
+    if _STATS_TIMING_EVERY <= 0:
+        return False
+    return next(_stats_req_counter) % _STATS_TIMING_EVERY == 0
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +414,14 @@ def stats():
              '7d': now - timedelta(days=7),
              '30d': now - timedelta(days=30)}.get(window, now - timedelta(hours=24))
 
+    _smp = _stats_should_sample()          # sampled latency instrumentation (default OFF)
+    _t0 = time.perf_counter() if _smp else 0.0
+    _t_conn = _t_agg = _t_recent = _t0
+
     with db_session() as s:
+        if _smp:
+            s.connection()                 # force the connection so its setup is timed apart
+            _t_conn = time.perf_counter()
         # Scope by the IMMUTABLE per-claim ownership snapshot (telegram_id), NOT by
         # currently-owned slot_ids. This is the privacy boundary AND the retention
         # guarantee: a buyer sees exactly THEIR OWN claims for the full window even
@@ -411,27 +439,16 @@ def stats():
             type_conds = [ApiClaim.claim_type == 'reload']
         base = [ApiClaim.telegram_id == tid, ApiClaim.created_at >= since, *type_conds]
 
-        # Earnings grouped PER CURRENCY (never cross-summed).
-        earned_rows = s.execute(
-            select(ApiClaim.currency, func.coalesce(func.sum(ApiClaim.amount), 0.0),
-                   func.count(ApiClaim.id))
-            .where(and_(*base, ApiClaim.claimed.is_(True)))
-            .group_by(ApiClaim.currency)
-        ).all()
-        earned = {}
-        successful = 0
-        for cur, amt, cnt in earned_rows:
-            key = (cur or 'unknown').lower()
-            earned[key] = round(float(amt or 0.0), 8)
-            successful += int(cnt or 0)
-
-        # Per-USERNAME breakdown over the SAME window — how many codes each Stake
-        # account claimed AND how much it earned (windowed identically to the
-        # overall total; works for 24h/7d/30d). Shape:
+        # ONE windowed aggregate pass, grouped per (username, currency). It yields
+        # BOTH the per-USERNAME breakdown AND — rolled up by currency — the overall
+        # per-currency totals + successful count, so we do NOT run a second query with
+        # an identical predicate just to GROUP BY currency. Per-username shape:
         #   {username: {'claims': N, 'amounts': {currency: amount, ...}}}.
         # A username is included iff it has >=1 successful CLAIM (not iff amount>0),
         # so an account that claimed a zero/unknown-amount code still shows its count
-        # ("don't show those who didn't claim").
+        # ("don't show those who didn't claim"). Proven byte-for-byte equivalent to
+        # the former two-query (GROUP BY currency + GROUP BY user,currency) form across
+        # every window x type on rich real data — see MIGRATIONS.md ("Claims merge").
         by_user_rows = s.execute(
             select(ApiClaim.slot_username, ApiClaim.currency,
                    func.coalesce(func.sum(ApiClaim.amount), 0.0),
@@ -439,14 +456,36 @@ def stats():
             .where(and_(*base, ApiClaim.claimed.is_(True)))
             .group_by(ApiClaim.slot_username, ApiClaim.currency)
         ).all()
+
+        # Overall totals = these same rows rolled up by RAW currency, reproducing the
+        # old `GROUP BY currency` exactly: coalesce(sum,0) then ASSIGN, so a currency
+        # whose amount sums to 0 STILL gets a key (never cross-summed), and `successful`
+        # counts EVERY claimed row. amount is DOUBLE PRECISION, so sum the RAW amounts
+        # in one pass and round ONCE (rounding per-group then re-adding could drift by
+        # a last-ULP vs the old single SUM and is NOT byte-identical).
+        earned = {}
+        successful = 0
+        _earned_raw = {}          # raw currency value -> raw summed amount
+        _earned_order = []        # first-seen raw-currency order (mirrors query rows)
         earned_by_user = {}
         for uname, cur, amt, cnt in by_user_rows:
+            amt_raw = float(amt or 0.0)
+            cnt = int(cnt or 0)
+            successful += cnt
             u = earned_by_user.setdefault(uname or '?', {'claims': 0, 'amounts': {}})
-            u['claims'] += int(cnt or 0)
-            amt = round(float(amt or 0.0), 8)
-            if amt > 0:
-                u['amounts'][(cur or 'unknown').lower()] = amt
+            u['claims'] += cnt
+            amt_r = round(amt_raw, 8)
+            if amt_r > 0:
+                u['amounts'][(cur or 'unknown').lower()] = amt_r
+            if cur not in _earned_raw:
+                _earned_raw[cur] = 0.0
+                _earned_order.append(cur)
+            _earned_raw[cur] += amt_raw
+        for cur in _earned_order:
+            earned[(cur or 'unknown').lower()] = round(_earned_raw[cur], 8)
         earned_by_user = {k: v for k, v in earned_by_user.items() if v['claims'] > 0}
+        if _smp:
+            _t_agg = time.perf_counter()
 
         # Recent attempts (last 7 days), DETERMINISTICALLY ordered — the id DESC
         # secondary key means rows with an identical created_at never reorder
@@ -475,12 +514,25 @@ def stats():
             'type': (ct or 'drop'),
             'username': (uname or None),
         } for (c, cl, err, cur, a, ts, ct, uname) in recent]
+        if _smp:
+            _t_recent = time.perf_counter()
 
-    return jsonify({'ok': True, 'window': window, 'type': ctype,
+    resp = jsonify({'ok': True, 'window': window, 'type': ctype,
                     'earned': earned, 'earned_by_user': earned_by_user,
                     'successful_claims': successful,
                     'recent_codes': recent_codes,
-                    'recent_truncated': recent_truncated}), 200
+                    'recent_truncated': recent_truncated})
+    if _smp:
+        _ms = lambda a, b: (b - a) * 1000.0
+        _t_ser = time.perf_counter()
+        logger.info(
+            "stats timing tid=%s window=%s type=%s | conn=%.1f agg=%.1f recent=%.1f "
+            "serialize=%.1f total=%.1fms (rows: by_user=%d recent=%d) [backend-only; "
+            "excludes bot->backend hop + frontend render]",
+            tid, window, ctype, _ms(_t0, _t_conn), _ms(_t_conn, _t_agg),
+            _ms(_t_agg, _t_recent), _ms(_t_recent, _t_ser), _ms(_t0, _t_ser),
+            len(by_user_rows), len(recent))
+    return resp, 200
 
 
 @api_customer_bp.route('/drop', methods=['POST'])

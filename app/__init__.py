@@ -8,7 +8,8 @@ from flask_cors import CORS
 from flask_socketio import SocketIO
 
 from app.config import Config
-from app.database import SessionLocal, init_db, init_claims_db, ensure_api_claim_columns
+from app.database import (SessionLocal, init_db, init_claims_db,
+                          ensure_api_claim_columns, warn_if_stats_index_missing)
 from app.models import User
 from app.services import user_service
 from sqlalchemy import func, select
@@ -189,6 +190,9 @@ def create_app(config_class=Config):
             # non-fatal; needed before /stats or any claim recording runs.
             if Config.API_CLAIMER_MODE:
                 ensure_api_claim_columns()
+                # Read-only: warn (once) if the operational stats index is missing.
+                # Never builds/locks/blocks — the index ships via MIGRATIONS.md.
+                warn_if_stats_index_missing()
             user_service.start()
     except Exception as e:
         logging.error(

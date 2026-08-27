@@ -403,6 +403,46 @@ def ensure_api_claim_columns() -> None:
         )
 
 
+# The composite index that keeps GET /stats fast (recent-claims query =
+# ORDER BY created_at DESC, id DESC LIMIT). It is DELIBERATELY NOT created here:
+# on a large `api_claims` it must be built with CREATE INDEX CONCURRENTLY, which
+# cannot run inside a transaction and must never block/serialise app startup. It
+# ships as a one-time OPERATIONAL migration (see MIGRATIONS.md). This module only
+# ever CHECKS for it (read-only) — it never builds it and never drops it.
+STATS_RECENT_INDEX = "ix_api_claims_tid_created_at_id"
+
+
+def warn_if_stats_index_missing() -> None:
+    """
+    Read-only, best-effort startup CHECK: log ONE warning if the stats composite
+    index is absent so the operator knows to run the migration. Never issues DDL,
+    never locks, never blocks readiness; silent once the index exists. Postgres-only.
+    """
+    if not DATABASE_URL or not DATABASE_URL.startswith("postgresql"):
+        return
+    import logging
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            present = conn.execute(
+                text("SELECT 1 FROM pg_indexes WHERE tablename = 'api_claims' "
+                     "AND indexname = :n"),
+                {"n": STATS_RECENT_INDEX},
+            ).first()
+        if not present:
+            logging.getLogger(__name__).warning(
+                "stats index %s is MISSING on api_claims — GET /stats will be slow "
+                "on large data. Run the CREATE INDEX CONCURRENTLY migration in "
+                "MIGRATIONS.md (operational, one-time; the app never builds it).",
+                STATS_RECENT_INDEX,
+            )
+    except Exception as e:
+        # A check must never affect boot; degrade silently to a debug line.
+        logging.getLogger(__name__).debug(
+            f"warn_if_stats_index_missing skipped (non-fatal): {e}"
+        )
+
+
 @contextmanager
 def db_session() -> Generator:
     """
