@@ -589,9 +589,15 @@ def _start_slot_expiry_sweep(app):
                             try:
                                 notify_bot_service(
                                     tid,
-                                    f"⚠️ Your subscription for <b>{uname}</b> has expired.\n\n"
-                                    f"Recharge and purchase the slot again to keep your Stake "
-                                    f"account claiming <b>24×7</b>.")
+                                    f"⏰ <b>Subscription expired</b>\n"
+                                    f"━━━━━━━━━━━━━━━\n"
+                                    f"Your slot for <b>{uname}</b> just ran out, so we've "
+                                    f"<b>stopped auto-claiming</b> for it. 😔\n\n"
+                                    f"💸 Every drop from now on is a code you're missing.\n"
+                                    f"⚡ Renew in seconds and we're back to claiming "
+                                    f"<b>24×7</b> — you never lift a finger.\n\n"
+                                    f"👉 Open the app, tap <b>{uname}</b>, and hit "
+                                    f"<b>Renew</b> to pick up right where you left off. 🚀")
                             except Exception:
                                 pass
                             if admin_id:

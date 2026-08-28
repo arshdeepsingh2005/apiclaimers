@@ -208,6 +208,9 @@ def _customer_slot_view(slot, account, online):
         'slot_id': slot.id,
         'stake_username': slot.stake_username,
         'plan': slot.plan,
+        # Human-friendly plan name for the Mini App ("7 Days" not "d7"); falls back
+        # to the raw code for any unknown/legacy plan.
+        'plan_label': (get_plan(slot.plan) or {}).get('label') or slot.plan,
         'status': slot.status,
         'expires_at': slot.expires_at.isoformat() if slot.expires_at else None,
         'withdrawal_currency': slot.withdrawal_currency,

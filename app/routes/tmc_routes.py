@@ -1682,7 +1682,17 @@ def poll_live_capacity(timeout=5.0) -> dict:
                 break
         with _slotcap_lock:
             replies = dict(_slotcap_polls[req_id]['replies'])
-        available = sum(max(0, int(v.get('empty') or 0)) for v in replies.values())
+        # Dedup by license: the SAME license on N RDPs yields N sid replies that all
+        # describe the ONE account's empty slots — summing them double-counts. Group
+        # by license and count each account once (all its RDPs report the same empty).
+        # NOTE: _slotcap_lock is already released above, so get_session_by_sid (which
+        # takes _sessions_lock) never nests the two locks → no lock-ordering deadlock.
+        per_license = {}
+        for sid, v in replies.items():
+            rec = get_session_by_sid(sid)
+            lk = (rec or {}).get('license_key') or sid   # unknown sid → own bucket (never merges)
+            per_license[lk] = max(per_license.get(lk, 0), max(0, int(v.get('empty') or 0)))
+        available = sum(per_license.values())
         return {'available': int(available), 'workers': len(replies)}
     finally:
         with _slotcap_lock:
