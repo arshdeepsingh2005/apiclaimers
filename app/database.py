@@ -403,6 +403,38 @@ def ensure_api_claim_columns() -> None:
         )
 
 
+def ensure_api_order_columns() -> None:
+    """
+    Idempotently ensure the `cart_id` column exists on `api_orders` (multi-slot cart
+    grouping). `create_all` only CREATEs missing tables, never ALTERs an existing one,
+    so a pre-existing `api_orders` needs an explicit `ADD COLUMN IF NOT EXISTS`.
+
+    Bounded & safe: a small nullable column + a small index (NOT the big api_claims
+    index), `IF NOT EXISTS` on both so simultaneous boots can't race destructively,
+    best-effort/non-fatal (never blocks startup), and it runs ONLY here at startup —
+    never inside an application request. Skipped on non-Postgres.
+    """
+    if not DATABASE_URL or not DATABASE_URL.startswith("postgresql"):
+        return
+    import logging
+    from sqlalchemy import text
+    statements = (
+        "ALTER TABLE api_orders ADD COLUMN IF NOT EXISTS cart_id VARCHAR(64)",
+        "CREATE INDEX IF NOT EXISTS ix_api_orders_cart_id ON api_orders (cart_id)",
+    )
+    try:
+        with engine.begin() as conn:
+            for stmt in statements:
+                conn.execute(text(stmt))
+        logging.getLogger(__name__).info(
+            "ensure_api_order_columns: api_orders.cart_id ensured"
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"ensure_api_order_columns failed (non-fatal): {e}"
+        )
+
+
 # The composite index that keeps GET /stats fast (recent-claims query =
 # ORDER BY created_at DESC, id DESC LIMIT). It is DELIBERATELY NOT created here:
 # on a large `api_claims` it must be built with CREATE INDEX CONCURRENTLY, which

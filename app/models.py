@@ -426,6 +426,10 @@ class ApiOrder(Base):
     status = Column(String(24), nullable=False, default="pending", index=True)
     slot_id = Column(Integer, ForeignKey("api_slots.id", ondelete="SET NULL"), nullable=True)
 
+    # Multi-slot cart: all orders of one checkout share a cart_id so ONE combined
+    # OxaPay payment allocates every slot. NULL for legacy single-slot orders.
+    cart_id = Column(String(64), nullable=True, index=True)
+
     # Capacity reservation (unpaid hold; self-expiring).
     reserved_pool_account_id = Column(Integer, ForeignKey("api_accounts.id", ondelete="SET NULL"),
                                       nullable=True)

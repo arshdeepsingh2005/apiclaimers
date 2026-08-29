@@ -9,7 +9,8 @@ from flask_socketio import SocketIO
 
 from app.config import Config
 from app.database import (SessionLocal, init_db, init_claims_db,
-                          ensure_api_claim_columns, warn_if_stats_index_missing)
+                          ensure_api_claim_columns, ensure_api_order_columns,
+                          warn_if_stats_index_missing)
 from app.models import User
 from app.services import user_service
 from sqlalchemy import func, select
@@ -190,6 +191,7 @@ def create_app(config_class=Config):
             # non-fatal; needed before /stats or any claim recording runs.
             if Config.API_CLAIMER_MODE:
                 ensure_api_claim_columns()
+                ensure_api_order_columns()      # cart_id for multi-slot carts (idempotent)
                 # Read-only: warn (once) if the operational stats index is missing.
                 # Never builds/locks/blocks — the index ships via MIGRATIONS.md.
                 warn_if_stats_index_missing()
@@ -620,6 +622,15 @@ def _start_slot_expiry_sweep(app):
                         logger.info(f"Slot-sweep: reconciled {n} paid order(s) from missed webhooks")
                 except Exception:
                     logger.exception("slot reconcile failed (ignored)")
+                # Auto-fulfil backordered slots (paid, waiting on capacity) now that this
+                # sweep may have freed/added slots. Idempotent; DMs the buyer on activation.
+                try:
+                    from app.routes.api_customer import fulfil_awaiting_capacity
+                    m = fulfil_awaiting_capacity()
+                    if m:
+                        logger.info(f"Slot-sweep: auto-activated {m} backordered slot(s)")
+                except Exception:
+                    logger.exception("backorder fulfil failed (ignored)")
             except Exception as e:
                 logger.error(f"Error in slot expiry sweep: {e}", exc_info=True)
                 time.sleep(30)

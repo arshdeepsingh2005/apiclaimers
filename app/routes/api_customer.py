@@ -238,7 +238,9 @@ def _account_online(license_key) -> bool:
 
 # Poll-backed DISPLAY capacity (cached). Never the allocation authority.
 _cap_poll_cache = {'available': None, 'ts': 0.0}
-_CAP_POLL_TTL = 45.0
+# Display-only number (allocation always re-checks the DB authoritatively), so a
+# longer TTL is fine and roughly halves the getSlotCapacity fan-out to userscripts.
+_CAP_POLL_TTL = 90.0
 
 
 def _get_polled_available() -> int:
@@ -252,7 +254,9 @@ def _get_polled_available() -> int:
     polled = 0
     try:
         from app.routes.tmc_routes import poll_live_capacity
-        polled = int(poll_live_capacity(timeout=5).get('available', 0))
+        # Short poll: the front-end shows "Refreshing…" and fills this in async, so a
+        # tighter bound keeps the background refresh snappy on a cache miss.
+        polled = int(poll_live_capacity(timeout=2.5).get('available', 0))
     except Exception:
         logger.exception('capacity poll failed (ignored)')
     _cap_poll_cache = {'available': polled, 'ts': now_t}
@@ -344,6 +348,21 @@ def list_slots():
             v = _customer_slot_view(slot, account, online)
             v['expired'] = not _active_slot(slot, now)
             out.append(v)
+        # Paid-but-waiting-on-capacity orders show as "Activating" pending slots (cheap:
+        # telegram_id + status are both indexed). No token is ever exposed here.
+        pending = s.execute(
+            select(ApiOrder).where(ApiOrder.telegram_id == tid,
+                                   ApiOrder.status == 'awaiting_capacity')
+            .order_by(ApiOrder.id)
+        ).scalars().all()
+        for o in pending:
+            out.append({
+                'slot_id': None, 'stake_username': o.stake_username,
+                'plan': o.plan_code, 'plan_label': (get_plan(o.plan_code) or {}).get('label') or o.plan_code,
+                'status': 'activating', 'activating': True, 'expired': False, 'online': False,
+                'expires_at': None, 'worker_label': 'Activating',
+                'reload_available': None, 'reload_next_ms': None, 'reload_unavailable': False,
+            })
     return jsonify({'ok': True, 'slots': out}), 200
 
 
@@ -662,29 +681,207 @@ def order_begin():
                     'stake_username': username}), 200
 
 
-def _allocate_order(order_id, track_id=None, pay_status=None,
+@api_customer_bp.route('/order/cart-begin', methods=['POST'])
+def order_cart_begin():
+    """Create a multi-slot cart: one pending ApiOrder per item, all sharing ONE cart_id,
+    paid together by a single combined invoice. Body: {items:[{token, plan_code, config}]}.
+
+    SECURITY: the client's cart is UNTRUSTED stale state — every item is re-validated
+    server-side (plan purchasable + token FRESHLY re-verified). Prices are ALWAYS taken
+    from get_plan() server-side; any client-sent price/total is ignored. Tokens are
+    re-verified CONCURRENTLY (eventlet) so checkout ≈ one verify round-trip, not N×."""
+    if not _require_internal():
+        return _unauth()
+    data = request.get_json(silent=True) or {}
+    tid = _tid_from_request(data)
+    if not tid:
+        return _bad('telegram_id required')
+    items = data.get('items')
+    if not isinstance(items, list) or not items:
+        return _bad('items required')
+    if len(items) > int(getattr(Config, 'CART_MAX_ITEMS', 10)):
+        return _bad('too many items in cart', 'cart_too_big')
+
+    import json as _json
+    import eventlet
+    from app.routes.tmc_routes import verify_token_via_worker
+
+    # Normalise + reject structurally-bad items up front (plan must be purchasable).
+    norm = []
+    for it in items:
+        if not isinstance(it, dict):
+            return _bad('bad item', 'bad_item')
+        plan_code = (it.get('plan_code') or '').strip()
+        plan = get_plan(plan_code)
+        if not plan or not is_purchasable(plan_code):
+            return _bad(f'plan not available: {plan_code}', 'plan_unavailable')
+        token = (it.get('token') or '').strip()
+        if not token:
+            return _bad('API key required for every item')
+        cfg = it.get('config') if isinstance(it.get('config'), dict) else {}
+        norm.append({'plan_code': plan_code, 'plan': plan, 'token': token, 'config': cfg})
+
+    # Re-verify tokens concurrently, but in BOUNDED BATCHES — `VERIFY_MAX_CONCURRENT`
+    # is a GLOBAL waiter budget shared with every other buyer's verify, so firing all
+    # cart items at once could exhaust it and spuriously fail the cart. A half-budget
+    # batch keeps checkout fast (≈ one round-trip per batch) while leaving headroom.
+    def _vf(tok):
+        try:
+            return verify_token_via_worker(tok)
+        except Exception:
+            return {'valid': False, 'reason': 'unavailable'}
+    batch = max(1, int(Config.VERIFY_MAX_CONCURRENT) // 2)
+    results = []
+    for i in range(0, len(norm), batch):
+        greens = [eventlet.spawn(_vf, n['token']) for n in norm[i:i + batch]]
+        results.extend(g.wait() for g in greens)
+    for n, vres in zip(norm, results):
+        if not vres.get('valid'):
+            return _bad('a key could not be verified', 'verify_' + vres.get('reason', 'invalid'))
+        n['username'] = vres.get('username')
+
+    now = _now()
+    cart_id = uuid.uuid4().hex
+    out_items = []
+    total = 0.0
+    with db_session() as s:
+        # One active cart per buyer — supersede any prior pending orders (frees holds).
+        prior = s.execute(
+            select(ApiOrder).where(ApiOrder.telegram_id == tid, ApiOrder.status == 'pending')
+        ).scalars().all()
+        for p in prior:
+            p.status = 'reservation_expired'
+            p.enc_stake_token = None
+            p.reserved_pool_account_id = None
+            p.reserved_slot_index = None
+            p.reservation_expires_at = None
+        for n in norm:
+            oid = uuid.uuid4().hex
+            price = float(n['plan']['price_usd'])
+            total += price
+            s.add(ApiOrder(
+                order_id=oid, cart_id=cart_id, telegram_id=tid, plan_code=n['plan_code'],
+                price_usd=price, duration_days=int(n['plan']['duration_days']),
+                stake_username=n['username'], slot_config=_json.dumps(n['config']),
+                enc_stake_token=encrypt_token(n['token']), status='pending'))
+            out_items.append({'order_id': oid, 'stake_username': n['username'],
+                              'plan': {'code': n['plan_code'], 'label': n['plan']['label']},
+                              'price_usd': price})
+        s.flush()
+
+    return jsonify({'ok': True, 'cart_id': cart_id, 'total_usd': round(total, 2),
+                    'items': out_items}), 200
+
+
+def _place_paid_order(s, order, now):
+    """Place ONE already-PAID, already-FOR-UPDATE-locked order onto a free slot.
+    Payment is assumed verified by the caller. Returns:
+      ('allocated', license_key, slot_id) — slot assigned, order 'allocated', token WIPED
+      ('backorder', None, None)           — no capacity: order 'awaiting_capacity', token KEPT
+      ('token_lost', None, None)          — pending token gone → order 'failed'
+    The status flip is the caller's idempotency point (a second pass sees 'allocated')."""
+    import json as _json
+    token = decrypt_token(order.enc_stake_token)
+    if not token:
+        order.status = 'failed'
+        return ('token_lost', None, None)
+    acct, idx = _pick_free(
+        s, now, exclude_order_id=order.order_id,
+        prefer=((order.reserved_pool_account_id, order.reserved_slot_index)
+                if order.reserved_pool_account_id is not None
+                and order.reserved_slot_index is not None else None))
+    if acct is None:
+        # BACKORDER: keep the encrypted token + config so the auto-fulfil sweep can
+        # place it once capacity opens; the buyer sees this as "Activating".
+        order.status = 'awaiting_capacity'
+        return ('backorder', None, None)
+    try:
+        cfg = _json.loads(order.slot_config or '{}')
+    except Exception:
+        cfg = {}
+    slot = s.execute(
+        select(ApiSlot).where(ApiSlot.account_id == acct.id,
+                              ApiSlot.slot_index == idx)
+    ).scalar_one_or_none()
+    if slot is None:
+        slot = ApiSlot(account_id=acct.id, slot_index=idx)
+        s.add(slot)
+    from app.routes.api_slots import _token_fp
+    slot.slot_telegram_id = order.telegram_id
+    slot.stake_access_token = token
+    slot.token_fp = _token_fp(token)
+    slot.stake_username = order.stake_username
+    slot.token_valid = True
+    slot.withdrawal_currency = cfg.get('withdrawal_currency') or 'usdt'
+    slot.reload_currency = cfg.get('reload_currency') or 'usdt'
+    slot.auto_vault = bool(cfg.get('auto_vault'))
+    slot.auto_bonus = bool(cfg.get('auto_bonus'))
+    slot.auto_reload = bool(cfg.get('auto_reload'))
+    slot.value_filter = cfg.get('value_filter')
+    slot.plan = order.plan_code
+    slot.purchased_at = now
+    slot.expires_at = now + timedelta(days=int(order.duration_days))
+    slot.status = 'active'
+    s.flush()   # assign slot.id (unique (account,index) guards races)
+    order.slot_id = slot.id
+    order.status = 'allocated'
+    order.enc_stake_token = None                     # secure wipe
+    order.reserved_pool_account_id = None
+    order.reserved_slot_index = None
+    order.reservation_expires_at = None
+    return ('allocated', acct.license_key, slot.id)
+
+
+def _alert_backorder(orders):
+    """Admin DM (once per batch) that N paid slots are waiting on capacity."""
+    if not orders:
+        return
+    try:
+        from app.utils.telegram import notify_admin_direct
+        names = ', '.join(sorted({(o.get('username') or '?') for o in orders}))
+        notify_admin_direct(
+            f"🆕 <b>{len(orders)} paid slot(s) waiting — pool full</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Accounts: <b>{names}</b>\n\n"
+            f"Add or activate a license (more capacity) and they will auto-activate "
+            f"on the next sweep. 💸 Buyers already paid — fulfil ASAP."
+        )
+    except Exception:
+        logger.exception("backorder admin alert failed (ignored)")
+
+
+def _allocate_order(ref, track_id=None, pay_status=None,
                     paid_amount=None, paid_currency=None):
-    """Core allocation — shared by POST /order/allocate and the reconcile sweep.
-    Returns (payload_dict, http_status). Idempotent, payment-integrity gated, and
-    transactional (FOR UPDATE + unique (account,index)). All OxaPay I/O happens
-    OUTSIDE the row lock."""
+    """Core allocation for a payment reference — `ref` is EITHER a single order_id OR a
+    cart_id (allocate every order in that cart). Returns (payload_dict, http_status).
+    Idempotent, payment-integrity gated on the TOTAL, transactional (FOR UPDATE +
+    unique (account,index)); all OxaPay I/O happens OUTSIDE the row locks. A paid slot
+    with no free capacity becomes a backorder ('awaiting_capacity') instead of failing."""
     now = _now()
     if pay_status:
         pay_status = pay_status.lower()
     verified_by_backend = False
 
-    # Reconcile path: no track_id passed → read the one stored at invoice time.
-    if not track_id:
-        with db_session() as s:
-            row = s.execute(
-                select(ApiOrder.track_id).where(ApiOrder.order_id == order_id)
-            ).first()
-            track_id = (row[0] if row else None)
+    # Resolve ref → the orders to place (single order OR whole cart), the expected
+    # TOTAL price (Σ over not-yet-allocated orders — idempotent re-runs don't re-charge),
+    # and a stored track_id if none was passed.
+    with db_session() as s:
+        single = s.execute(select(ApiOrder).where(ApiOrder.order_id == ref)).scalar_one_or_none()
+        if single is not None:
+            cart_orders = [single]
+        else:
+            cart_orders = s.execute(
+                select(ApiOrder).where(ApiOrder.cart_id == ref).order_by(ApiOrder.id)
+            ).scalars().all()
+        order_ids = [o.order_id for o in cart_orders]
+        if not order_ids:
+            return {'ok': False, 'code': 'not_found', 'error': 'order not found'}, 404
+        expected_total = sum(float(o.price_usd) for o in cart_orders if o.status != 'allocated')
+        if not track_id:
+            track_id = next((o.track_id for o in cart_orders if o.track_id), None)
 
-    # DEFENSE-IN-DEPTH (matches the legacy backend): with our OWN OxaPay key we
-    # INDEPENDENTLY re-verify the invoice (eventlet-safe curl get_payment) and use
-    # THAT as authoritative — never trusting the bot-passed amount/status. No key
-    # configured → fall back to the (internal-token-gated) bot-passed values.
+    # DEFENSE-IN-DEPTH: with our OWN OxaPay key, independently re-verify the invoice and
+    # use THAT as authoritative — never trusting bot-passed amount/status.
     if Config.OXAPAY_MERCHANT_KEY and track_id:
         try:
             from app import oxapay as _oxa
@@ -705,112 +902,131 @@ def _allocate_order(order_id, track_id=None, pay_status=None,
         if info.get('currency'):
             paid_currency = str(info.get('currency')).upper()
 
-    # POSITIVE-PROOF REQUIREMENT: never allocate without evidence of payment. If
-    # the backend did NOT independently verify (no key / no track_id), the caller
-    # (the internal-token-gated bot) MUST assert a paid status — otherwise refuse.
-    # Closes a free-slot path when allocate is called with no payment info.
+    # POSITIVE-PROOF: never allocate without evidence of payment.
     if not verified_by_backend:
         if not pay_status or pay_status not in ('paid', 'confirmed', 'complete', 'completed'):
             return {'ok': False, 'code': 'not_paid',
                     'error': 'no payment proof (backend has no OxaPay key and no paid status supplied)'}, 402
-
-    for attempt in range(4):
+    if pay_status and pay_status not in ('paid', 'confirmed', 'complete', 'completed'):
+        return {'ok': False, 'code': 'not_paid', 'error': 'payment not confirmed'}, 402
+    # Amount integrity: paid must cover the CART TOTAL (never a per-order fraction).
+    if paid_amount is not None and expected_total > 0:
         try:
-            account_key = None
-            slot_id = None
-            with db_session() as s:
-                order = s.execute(
-                    select(ApiOrder).where(ApiOrder.order_id == order_id)
-                    .with_for_update()
-                ).scalar_one_or_none()
-                if not order:
-                    return {'ok': False, 'code': 'not_found', 'error': 'order not found'}, 404
-                if order.status == 'allocated':
-                    return {'ok': True, 'already_allocated': True, 'slot_id': order.slot_id}, 200
-                if order.status not in ('pending', 'paid'):
-                    return {'ok': False, 'code': 'bad_state', 'error': f'order is {order.status}'}, 409
+            if float(paid_amount) + 1e-6 < float(expected_total):
+                return {'ok': False, 'code': 'amount_mismatch',
+                        'error': 'paid amount below total'}, 402
+        except (TypeError, ValueError):
+            return {'ok': False, 'code': 'amount_mismatch', 'error': 'bad paid amount'}, 402
 
-                # Payment-integrity gate.
-                if pay_status and pay_status not in ('paid', 'confirmed', 'complete', 'completed'):
-                    return {'ok': False, 'code': 'not_paid', 'error': 'payment not confirmed'}, 402
-                if paid_amount is not None:
-                    try:
-                        if float(paid_amount) + 1e-6 < float(order.price_usd):
-                            return {'ok': False, 'code': 'amount_mismatch',
-                                    'error': 'paid amount below price'}, 402
-                    except (TypeError, ValueError):
-                        return {'ok': False, 'code': 'amount_mismatch', 'error': 'bad paid amount'}, 402
-                order.status = 'paid'
-                order.track_id = track_id or order.track_id
-
-                token = decrypt_token(order.enc_stake_token)
-                if not token:
-                    order.status = 'failed'
-                    return {'ok': False, 'code': 'token_lost', 'error': 'pending token unavailable'}, 500
-
-                acct, idx = _pick_free(
-                    s, now, exclude_order_id=order.order_id,
-                    prefer=((order.reserved_pool_account_id, order.reserved_slot_index)
-                            if order.reserved_pool_account_id is not None
-                            and order.reserved_slot_index is not None else None))
-                if acct is None:
-                    order.status = 'failed'
-                    logger.error(f"allocate: NO capacity for paid order {order_id} — refund needed")
-                    return {'ok': False, 'code': 'no_capacity', 'error': 'no free slot — refund required'}, 409
-
-                import json as _json
-                try:
-                    cfg = _json.loads(order.slot_config or '{}')
-                except Exception:
-                    cfg = {}
-
-                slot = s.execute(
-                    select(ApiSlot).where(ApiSlot.account_id == acct.id,
-                                          ApiSlot.slot_index == idx)
-                ).scalar_one_or_none()
-                if slot is None:
-                    slot = ApiSlot(account_id=acct.id, slot_index=idx)
-                    s.add(slot)
-
-                from app.routes.api_slots import _token_fp
-                slot.slot_telegram_id = order.telegram_id
-                slot.stake_access_token = token
-                slot.token_fp = _token_fp(token)
-                slot.stake_username = order.stake_username
-                slot.token_valid = True
-                slot.withdrawal_currency = cfg.get('withdrawal_currency') or 'usdt'
-                slot.reload_currency = cfg.get('reload_currency') or 'usdt'
-                slot.auto_vault = bool(cfg.get('auto_vault'))
-                slot.auto_bonus = bool(cfg.get('auto_bonus'))
-                slot.auto_reload = bool(cfg.get('auto_reload'))
-                slot.value_filter = cfg.get('value_filter')
-                slot.plan = order.plan_code
-                slot.purchased_at = now
-                slot.expires_at = now + timedelta(days=int(order.duration_days))
-                slot.status = 'active'
-                s.flush()   # assign slot.id (unique (account,index) guards races)
-
-                order.slot_id = slot.id
-                order.status = 'allocated'
-                order.enc_stake_token = None                     # secure wipe
-                order.reserved_pool_account_id = None
-                order.reserved_slot_index = None
-                order.reservation_expires_at = None
-                account_key = acct.license_key
-                slot_id = slot.id
-
-            # Committed → push the new slot to the operator's script(s).
+    placed = []       # (order_id, slot_id)
+    backordered = []  # {order_id, username}
+    pushes = set()
+    errors = []
+    for oid in order_ids:
+        for attempt in range(4):
             try:
-                from app.routes.tmc_routes import push_slots_to_account
-                push_slots_to_account(account_key)
-            except Exception:
-                logger.exception('push after allocate failed (ignored)')
-            return {'ok': True, 'slot_id': slot_id}, 200
+                account_key = None
+                outcome = None
+                with db_session() as s:
+                    o = s.execute(select(ApiOrder).where(ApiOrder.order_id == oid)
+                                  .with_for_update()).scalar_one_or_none()
+                    if not o:
+                        outcome = 'gone'
+                        break
+                    if o.status == 'allocated':
+                        placed.append((oid, o.slot_id)); outcome = 'already'; break
+                    if o.status not in ('pending', 'paid', 'awaiting_capacity'):
+                        errors.append((oid, o.status)); outcome = 'bad_state'; break
+                    o.status = 'paid'                       # payment already verified above
+                    o.track_id = track_id or o.track_id
+                    outcome, account_key, slot_id = _place_paid_order(s, o, now)
+                    if outcome == 'allocated':
+                        placed.append((oid, slot_id))
+                    elif outcome == 'backorder':
+                        backordered.append({'order_id': oid, 'username': o.stake_username})
+                    elif outcome == 'token_lost':
+                        errors.append((oid, 'token_lost'))
+                if account_key:
+                    pushes.add(account_key)
+                break                                       # done with this order
+            except IntegrityError:
+                logger.warning(f"allocate: index race for order {oid}, retry {attempt}")
+                continue
 
-        except IntegrityError:
-            logger.warning(f"allocate: index race for order {order_id}, retry {attempt}")
-            continue
-    return {'ok': False, 'code': 'contention', 'error': 'could not allocate, retry'}, 503
+    for lk in pushes:
+        try:
+            from app.routes.tmc_routes import push_slots_to_account
+            push_slots_to_account(lk)
+        except Exception:
+            logger.exception('push after allocate failed (ignored)')
+    if backordered:
+        logger.warning(f"allocate: {len(backordered)} paid slot(s) backordered (no capacity) for ref {ref}")
+        _alert_backorder(backordered)
+
+    # Response — keep the single-order shape for the existing bot worker.
+    if len(order_ids) == 1:
+        if placed:
+            return {'ok': True, 'slot_id': placed[0][1]}, 200
+        if backordered:
+            return {'ok': True, 'backordered': 1, 'slot_id': None}, 200
+        if errors:
+            return {'ok': False, 'code': errors[0][1], 'error': f'order {errors[0][1]}'}, 409
+        return {'ok': False, 'code': 'contention', 'error': 'could not allocate, retry'}, 503
+    return {'ok': True, 'cart_id': ref, 'allocated': len(placed),
+            'backordered': len(backordered), 'errors': len(errors)}, 200
+
+
+def fulfil_awaiting_capacity(limit=50):
+    """Auto-fulfil sweep: place already-PAID `awaiting_capacity` orders now that capacity
+    may be free. Skips payment re-verification (already paid). Idempotent via FOR UPDATE +
+    the status guard — a doubly-processed order yields exactly one slot / one push / one
+    buyer DM. Best-effort and bounded (only places up to the free slots each pass)."""
+    now = _now()
+    with db_session() as s:
+        oids = s.execute(
+            select(ApiOrder.order_id).where(ApiOrder.status == 'awaiting_capacity')
+            .order_by(ApiOrder.id).limit(limit)
+        ).scalars().all()
+    fulfilled = 0
+    for oid in oids:
+        for attempt in range(4):
+            try:
+                account_key = None
+                slot_username = None
+                telegram_id = None
+                with db_session() as s:
+                    o = s.execute(select(ApiOrder).where(ApiOrder.order_id == oid)
+                                  .with_for_update()).scalar_one_or_none()
+                    if not o or o.status != 'awaiting_capacity':
+                        break                               # gone / already placed by a racer
+                    outcome, account_key, slot_id = _place_paid_order(s, o, now)
+                    if outcome == 'allocated':
+                        slot_username = o.stake_username
+                        telegram_id = o.telegram_id
+                if account_key:                             # committed → push + buyer DM once
+                    fulfilled += 1
+                    try:
+                        from app.routes.tmc_routes import push_slots_to_account
+                        push_slots_to_account(account_key)
+                    except Exception:
+                        logger.exception('push after fulfil failed (ignored)')
+                    if telegram_id:
+                        try:
+                            from app.utils.telegram import notify_bot_service
+                            notify_bot_service(
+                                int(telegram_id),
+                                f"✅ <b>Your slot is now active</b>\n"
+                                f"━━━━━━━━━━━━━━━\n"
+                                f"<b>{slot_username or 'your account'}</b> is claiming again — "
+                                f"capacity opened up and we placed it automatically. 🚀")
+                        except Exception:
+                            logger.exception('buyer now-active DM failed (ignored)')
+                break                                       # done with this order
+            except IntegrityError:
+                continue
+    if fulfilled:
+        logger.info(f"fulfil_awaiting_capacity: placed {fulfilled} backordered slot(s)")
+    return fulfilled
 
 
 @api_customer_bp.route('/order/track', methods=['POST'])
@@ -832,6 +1048,53 @@ def order_track():
             return jsonify({'ok': False, 'code': 'not_found'}), 404
         if order.status == 'pending':
             order.track_id = track_id
+    return jsonify({'ok': True}), 200
+
+
+@api_customer_bp.route('/order/cart/<cart_id>', methods=['GET'])
+def order_cart_get(cart_id):
+    """Server-authoritative cart summary for invoice creation — the browser can NEVER
+    assert the amount. Ownership-scoped by telegram_id. Returns the Σ price over the
+    cart's not-yet-allocated orders."""
+    if not _require_internal():
+        return _unauth()
+    tid = _tid_from_request(None)
+    cart_id = (cart_id or '').strip()
+    if not tid or not cart_id:
+        return _bad('telegram_id and cart_id required')
+    with db_session() as s:
+        rows = s.execute(
+            select(ApiOrder.price_usd, ApiOrder.status).where(
+                ApiOrder.cart_id == cart_id, ApiOrder.telegram_id == tid)
+        ).all()
+    if not rows:
+        return jsonify({'ok': False, 'code': 'not_found'}), 404
+    total = round(sum(float(p) for p, st in rows if st != 'allocated'), 2)
+    n_alloc = sum(1 for _, st in rows if st == 'allocated')
+    n_activating = sum(1 for _, st in rows if st == 'awaiting_capacity')
+    n_pending = sum(1 for _, st in rows if st == 'pending')
+    return jsonify({'ok': True, 'cart_id': cart_id, 'total_usd': total,
+                    'count': len(rows), 'all_allocated': n_alloc == len(rows),
+                    'allocated': n_alloc, 'activating': n_activating,
+                    'settled': n_pending == 0}), 200
+
+
+@api_customer_bp.route('/order/cart-track', methods=['POST'])
+def order_cart_track():
+    """Persist the OxaPay track_id on EVERY pending order of a cart (missed-webhook
+    recovery for the combined payment)."""
+    if not _require_internal():
+        return _unauth()
+    data = request.get_json(silent=True) or {}
+    cart_id = (data.get('cart_id') or '').strip()
+    track_id = (data.get('track_id') or '').strip()
+    if not cart_id or not track_id:
+        return _bad('cart_id and track_id required')
+    with db_session() as s:
+        from sqlalchemy import update as _update
+        s.execute(_update(ApiOrder)
+                  .where(ApiOrder.cart_id == cart_id, ApiOrder.status == 'pending')
+                  .values(track_id=track_id))
     return jsonify({'ok': True}), 200
 
 
@@ -867,20 +1130,30 @@ def reconcile_pending_orders(max_age_min=180):
     cutoff = now - timedelta(minutes=max_age_min)
     with db_session() as s:
         rows = s.execute(
-            select(ApiOrder.order_id).where(
+            select(ApiOrder.order_id, ApiOrder.cart_id).where(
                 ApiOrder.status == 'pending',
                 ApiOrder.track_id.isnot(None),
                 ApiOrder.created_at >= cutoff)
             .limit(50)
-        ).scalars().all()
+        ).all()
+    # Dedup by cart: a cart's orders must be allocated by cart_id (ONE total-based
+    # payment check), never per-order (which would let a partial payment through).
+    refs = []
+    seen = set()
+    for order_id, cart_id in rows:
+        ref = cart_id or order_id
+        if ref in seen:
+            continue
+        seen.add(ref)
+        refs.append(ref)
     done = 0
-    for oid in rows:
+    for ref in refs:
         try:
-            payload, _ = _allocate_order(oid)   # verifies via stored track_id
+            payload, _ = _allocate_order(ref)   # verifies via stored track_id, total-gated
             if payload.get('ok'):
                 done += 1
         except Exception:
-            logger.exception(f"reconcile: order {oid} failed (ignored)")
+            logger.exception(f"reconcile: ref {ref} failed (ignored)")
     return done
 
 

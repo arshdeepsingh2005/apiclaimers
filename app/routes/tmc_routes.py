@@ -1561,20 +1561,27 @@ def emit_drop_to_slots(license_key: str, code: str, target_slot_ids, coupon_type
 # results ignored, disconnect cleanup. The token is used transiently only — never
 # logged, never persisted.
 # ---------------------------------------------------------------------------
-_verify_waiters = {}          # req_id -> {event, sid, result, got, done}
+_verify_waiters = {}          # req_id -> {event, pending:set(sids), result, got, any_reply, done}
 _verify_lock = threading.Lock()
 
 
 def _fail_verify_waiters_for_sid(sid):
-    """A worker disconnected — release any verify waiters routed to it."""
+    """A worker disconnected — drop it from every verify waiter's pending set. Only
+    FAIL a waiter (→ 'unavailable') when ALL its fanned-out targets are gone and none
+    returned a username; if other targets are still pending, keep waiting on them."""
     with _verify_lock:
         for w in _verify_waiters.values():
-            if w.get('sid') == sid and not w.get('done'):
-                w['done'] = True
-                try:
-                    w['event'].send(False)
-                except Exception:
-                    pass
+            if w.get('done'):
+                continue
+            pending = w.get('pending')
+            if pending and sid in pending:
+                pending.discard(sid)
+                if not pending and not w.get('got'):
+                    w['done'] = True
+                    try:
+                        w['event'].send(False)
+                    except Exception:
+                        pass
 
 
 def verify_token_via_worker(token: str) -> dict:
@@ -1589,31 +1596,38 @@ def verify_token_via_worker(token: str) -> dict:
     if not sids:
         return {'valid': False, 'reason': 'unavailable'}
 
+    # Fan out to up to VERIFY_FANOUT_MAX connected workers under ONE req_id: the
+    # FIRST worker to resolve a username WINS (fast even if other RDPs are laggy).
+    targets = list(sids)[:max(1, int(Config.VERIFY_FANOUT_MAX))]
     with _verify_lock:
         if len(_verify_waiters) >= Config.VERIFY_MAX_CONCURRENT:
             return {'valid': False, 'reason': 'unavailable'}
         req_id = uuid.uuid4().hex
-        target_sid = sids[0]
         _verify_waiters[req_id] = {
-            'event': Event(), 'sid': target_sid, 'result': None,
-            'got': False, 'done': False,
+            'event': Event(), 'pending': set(targets), 'result': None,
+            'got': False, 'any_reply': False, 'done': False,
         }
         ev = _verify_waiters[req_id]['event']
 
     try:
-        socketio.emit('verifyToken', {'req_id': req_id, 'token': token},
-                      to=target_sid, namespace=TMC_NS)
+        for sid in targets:
+            try:
+                socketio.emit('verifyToken', {'req_id': req_id, 'token': token},
+                              to=sid, namespace=TMC_NS)
+            except Exception:
+                pass
         with eventlet.Timeout(Config.VERIFY_TIMEOUT_S, False):
-            ev.wait()   # resolved by tmc_verify_token_result, disconnect, or timeout
+            ev.wait()   # first-username / all-replied-no-user / all-gone / timeout
         with _verify_lock:
             w = _verify_waiters.get(req_id) or {}
             got = w.get('got', False)
             username = w.get('result')
-        if not got:
-            return {'valid': False, 'reason': 'unavailable'}     # timeout / worker gone
-        if username:
-            return {'valid': True, 'username': username}
-        return {'valid': False, 'reason': 'invalid'}             # worker resolved → no user
+            any_reply = w.get('any_reply', False)
+        if got and username:
+            return {'valid': True, 'username': username}         # a worker resolved a user
+        if any_reply:
+            return {'valid': False, 'reason': 'invalid'}         # worker(s) actively said "no user"
+        return {'valid': False, 'reason': 'unavailable'}         # timeout / only disconnects
     finally:
         with _verify_lock:
             _verify_waiters.pop(req_id, None)                    # ALWAYS remove
@@ -1639,13 +1653,28 @@ def tmc_verify_token_result(data=None):
         w = _verify_waiters.get(req_id)
         if not w or w.get('done'):
             return   # unknown or already-resolved/late → ignore safely
-        w['result'] = username
-        w['got'] = True
-        w['done'] = True
-        try:
-            w['event'].send(True)
-        except Exception:
-            pass
+        w['any_reply'] = True
+        if username:
+            # First worker to resolve a username WINS — resolve immediately.
+            w['result'] = username
+            w['got'] = True
+            w['done'] = True
+            try:
+                w['event'].send(True)
+            except Exception:
+                pass
+        else:
+            # This worker checked and found no user — drop it; if EVERY fanned-out
+            # target has now answered without a username, the key is invalid.
+            pending = w.get('pending')
+            if pending is not None:
+                pending.discard(request.sid)
+            if not w.get('pending'):
+                w['done'] = True
+                try:
+                    w['event'].send(True)
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------

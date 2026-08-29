@@ -88,6 +88,12 @@ class Config:
     VERIFY_TIMEOUT_S = float(os.environ.get('VERIFY_TIMEOUT_S', '8'))
     VERIFY_MAX_CONCURRENT = int(os.environ.get('VERIFY_MAX_CONCURRENT', '8'))
     VERIFY_RATE_PER_MIN = int(os.environ.get('VERIFY_RATE_PER_MIN', '20'))
+    # Fan a verify to up to this many connected workers at once (first username reply
+    # wins). Bounded so one key-check can't burst a Stake call across dozens of RDPs.
+    VERIFY_FANOUT_MAX = int(os.environ.get('VERIFY_FANOUT_MAX', '10'))
+    # Max slots per multi-slot cart checkout (aligned with VERIFY_MAX_CONCURRENT so the
+    # concurrent re-verify at cart-begin doesn't exceed the verify pool).
+    CART_MAX_ITEMS = int(os.environ.get('CART_MAX_ITEMS', '10'))
     # Unpaid slot reservation hold (seconds) — short + self-expiring so an
     # abandoned checkout frees the slot for others. Default = OxaPay invoice life.
     RESERVATION_TTL_S = int(os.environ.get('RESERVATION_TTL_S', str(30 * 60)))
