@@ -362,6 +362,27 @@ def ensure_claimer_apis_table() -> None:
         )
 
 
+def ensure_bot_users_table() -> None:
+    """
+    Idempotently create the `bot_users` table (first-seen registry for the bot-start
+    admin alert). Same pattern as `ensure_payments_table`: `create(checkfirst=True)`
+    is a no-op when the table already exists and otherwise builds it — no manual
+    migration. Best-effort: a failure here must never crash startup; the /user/seen
+    endpoint simply returns a 5xx (and the bot skips the alert) until it exists.
+    """
+    if not DATABASE_URL:
+        return
+    import logging
+    try:
+        from app.models import BotUser  # noqa: F401 (registers table on Base)
+        BotUser.__table__.create(bind=engine, checkfirst=True)
+        logging.getLogger(__name__).info("ensure_bot_users_table: bot_users table ensured")
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"ensure_bot_users_table failed (non-fatal): {e}"
+        )
+
+
 def ensure_api_claim_columns() -> None:
     """
     Idempotently ensure the immutable ownership-snapshot column exists on

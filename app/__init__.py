@@ -10,7 +10,7 @@ from flask_socketio import SocketIO
 from app.config import Config
 from app.database import (SessionLocal, init_db, init_claims_db,
                           ensure_api_claim_columns, ensure_api_order_columns,
-                          warn_if_stats_index_missing)
+                          ensure_bot_users_table, warn_if_stats_index_missing)
 from app.models import User
 from app.services import user_service
 from sqlalchemy import func, select
@@ -192,6 +192,7 @@ def create_app(config_class=Config):
             if Config.API_CLAIMER_MODE:
                 ensure_api_claim_columns()
                 ensure_api_order_columns()      # cart_id for multi-slot carts (idempotent)
+                ensure_bot_users_table()        # first-seen registry for bot-start alert (idempotent)
                 # Read-only: warn (once) if the operational stats index is missing.
                 # Never builds/locks/blocks — the index ships via MIGRATIONS.md.
                 warn_if_stats_index_missing()

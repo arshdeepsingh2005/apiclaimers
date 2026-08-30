@@ -439,3 +439,18 @@ class ApiOrder(Base):
     track_id = Column(String(80), nullable=True)                             # OxaPay track id
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class BotUser(Base):
+    """
+    First-seen registry for the Telegram bot — one row per Telegram user the FIRST
+    time they /start the bot. Used only to fire the admin "new user" alert exactly
+    once per person (the unique PK makes the insert atomic: the first caller for a
+    tid commits, any concurrent/later caller hits the conflict). Purely operational;
+    carries no product state.
+    """
+
+    __tablename__ = "bot_users"
+
+    telegram_id = Column(BigInteger, primary_key=True)                        # one row per user
+    first_seen = Column(DateTime(timezone=True), server_default=func.now())

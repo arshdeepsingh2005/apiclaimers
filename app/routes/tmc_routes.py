@@ -348,6 +348,59 @@ def _admin_offline_alert(license_key: str, username: str) -> None:
         logger.exception("admin offline alert failed (ignored)")
 
 
+# API-Claimer: admin alert when a userscript genuinely can't mint Turnstile tokens.
+# Reason is an ALLOWLIST — any other value is dropped (never rendered, never cooldowned),
+# so a hostile/buggy client can't inject text or bypass the cooldown with novel strings.
+OPS_ALERT_COOLDOWN_S = float(os.environ.get('OPS_ALERT_COOLDOWN_S', '90'))
+_OPS_REASON_LABELS = {
+    'gen_failing': 'Turnstile generation is FAILING (Cloudflare/network rejecting solves)',
+    'queue_overloaded': 'Token queue OVERLOADED — claims are waiting for tokens',
+}
+_ops_alert_last = {}                     # (license_key, reason) -> last-sent monotonic ts
+_ops_alert_lock = threading.Lock()
+
+
+def _admin_ops_alert(license_key: str, reason: str, username: str,
+                     alive, target) -> None:
+    """Best-effort admin DM that a userscript can't produce tokens. `reason` MUST be an
+    allowlisted key; unknown reasons are dropped BEFORE the cooldown is consulted (so they
+    can't be used to bypass it). Every rendered field is escaped/clamped. Never raises."""
+    if not Config.API_CLAIMER_MODE or not license_key:
+        return
+    label = _OPS_REASON_LABELS.get(reason)
+    if not label:
+        return                           # unknown reason → ignore (no alert, no cooldown entry)
+    try:
+        now = time.monotonic()
+        cooldown_key = (license_key, reason)
+        with _ops_alert_lock:
+            if now - _ops_alert_last.get(cooldown_key, 0.0) < OPS_ALERT_COOLDOWN_S:
+                return
+            _ops_alert_last[cooldown_key] = now
+            if len(_ops_alert_last) > 10000:              # opportunistic prune
+                cutoff = now - OPS_ALERT_COOLDOWN_S
+                for k in [k for k, v in _ops_alert_last.items() if v < cutoff]:
+                    _ops_alert_last.pop(k, None)
+        # Clamp the numeric fields to a sane range; escape the username. license_key is
+        # server-trusted (from session_info), rendered in full for the admin.
+        def _clamp_int(v):
+            try:
+                return max(0, min(10000, int(v)))
+            except (TypeError, ValueError):
+                return '?'
+        alive_s, target_s = _clamp_int(alive), _clamp_int(target)
+        msg = (f"🛑 <b>Token generation problem</b>\n"
+               f"🔑 <code>{safe_html(license_key)}</code>\n"
+               f"👤 {safe_html((username or '-'))[:32]}\n"
+               f"⚠️ {label}\n"
+               f"🎟 tokens: {alive_s}/{target_s}\n"
+               f"🕐 {_now_ist()}")
+        from app.utils.telegram import notify_admin_direct
+        notify_admin_direct(msg)
+    except Exception:
+        logger.exception("admin ops alert failed (ignored)")
+
+
 def _fmt_disconnect_msg(username: str, license_key: str, duration_s: int) -> str:
     # Mirror layout of connect, with session length surfaced prominently
     # (operators usually care: "did they leave quickly or stick around?").
@@ -1188,6 +1241,32 @@ def on_send_browsers(data):
 
     _add_browsers_response(session_info['license_key'], data)
     return {'ok': True, 'received': True}
+
+
+@socketio.on('apiOpsAlert', namespace=TMC_NS)
+def on_api_ops_alert(data):
+    """Userscript reports it genuinely can't produce Turnstile tokens. The license_key
+    is taken from the SERVER's session (never the payload), the reason is allowlisted,
+    and every field is escaped/clamped in _admin_ops_alert. Malformed payloads are
+    ignored. Fire-and-forget from the client (no ack needed)."""
+    sid = request.sid
+    session_info = get_session_by_sid(sid)
+    if not session_info:
+        return {'ok': False, 'error': 'not_authenticated'}
+    if not isinstance(data, dict):
+        return {'ok': False, 'error': 'bad_payload'}
+    reason = data.get('reason')
+    if not isinstance(reason, str):
+        return {'ok': False, 'error': 'bad_reason'}
+    try:
+        _admin_ops_alert(
+            session_info['license_key'], reason,
+            data.get('username') or session_info.get('username') or '-',
+            data.get('alive'), data.get('target'),
+        )
+    except Exception:
+        logger.exception("on_api_ops_alert failed (ignored)")
+    return {'ok': True}
 
 
 @socketio.on('tmc_update_identity', namespace=TMC_NS)

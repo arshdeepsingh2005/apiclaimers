@@ -375,6 +375,37 @@ def lic_browsers():
     return jsonify(agg), 200
 
 
+@xr9k_bp.route('/user/seen', methods=['POST'])
+def user_seen():
+    """Record a Telegram user's FIRST /start. Atomic via the bot_users unique PK:
+    the first caller for a tid inserts (is_new=true); any concurrent/later caller
+    hits the PK conflict (is_new=false). Used to fire the admin 'new user' alert
+    exactly once per person. DB-agnostic (IntegrityError on both Postgres/SQLite)."""
+    _require_internal_token()
+    data = request.get_json(silent=True) or {}
+    try:
+        telegram_id = int(data.get('telegram_id') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'bad_telegram_id'}), 400
+    if not telegram_id:
+        return jsonify({'error': 'telegram_id required'}), 400
+
+    from app.database import db_session
+    from app.models import BotUser
+    from sqlalchemy.exc import IntegrityError
+    is_new = False
+    try:
+        with db_session() as session:
+            session.add(BotUser(telegram_id=telegram_id))
+        is_new = True
+    except IntegrityError:
+        is_new = False          # already seen — the PK conflict is the dedup
+    except Exception as exc:
+        logger.warning(f"user_seen failed: {exc}")
+        return jsonify({'error': 'db_error'}), 500
+    return jsonify({'ok': True, 'is_new': is_new}), 200
+
+
 @xr9k_bp.route('/admin/connected', methods=['GET'])
 def admin_connected():
     """Admin overview: every connected license, its live userscript count, and each
