@@ -375,6 +375,21 @@ def lic_browsers():
     return jsonify(agg), 200
 
 
+@xr9k_bp.route('/admin/connected', methods=['GET'])
+def admin_connected():
+    """Admin overview: every connected license, its live userscript count, and each
+    userscript's live-token count (no username dedup). Mirrors lic_browsers but spans
+    ALL connected licenses in a single bounded poll."""
+    _require_internal_token()
+    try:
+        from app.routes import tmc_routes
+        out = tmc_routes.collect_all_connected(wait_seconds=5.0)
+    except Exception as exc:
+        logger.warning(f"admin_connected failed: {exc}")
+        out = {'licenses': [], 'totals': {'licenses': 0, 'userscripts': 0}}
+    return jsonify(out), 200
+
+
 @xr9k_bp.route('/lic/list', methods=['GET'])
 def lic_list():
     """Return ALL licenses (bot uses this to bootstrap its cache)."""

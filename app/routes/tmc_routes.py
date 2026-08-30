@@ -28,6 +28,7 @@ from app.license_manager import (
     add_session,
     all_connected_sids,
     can_admit,
+    connected_account_keys,
     decrypt_payload,
     encrypt_broadcast,
     encrypt_payload,
@@ -298,7 +299,7 @@ def _fmt_connect_msg(username: str, license_key: str) -> str:
 # so a late SID-A disconnect can't create a false "all offline" while SID-B lives).
 # Rate-limited per license to avoid flapping storms.
 OFFLINE_ALERT_COOLDOWN_S = float(os.environ.get('OFFLINE_ALERT_COOLDOWN_S', '30'))
-_offline_alert_last = {}                 # license_key -> last-sent monotonic ts
+_offline_alert_last = {}                 # (license_key, remaining) -> last-sent monotonic ts
 _offline_alert_lock = threading.Lock()
 
 
@@ -309,28 +310,35 @@ def _admin_offline_alert(license_key: str, username: str) -> None:
     if not Config.API_CLAIMER_MODE or not license_key:
         return
     try:
-        now = time.monotonic()
-        with _offline_alert_lock:
-            if now - _offline_alert_last.get(license_key, 0.0) < OFFLINE_ALERT_COOLDOWN_S:
-                return
-            _offline_alert_last[license_key] = now
-            if len(_offline_alert_last) > 10000:      # opportunistic prune
-                cutoff = now - OFFLINE_ALERT_COOLDOWN_S
-                for k in [k for k, v in _offline_alert_last.items() if v < cutoff]:
-                    _offline_alert_last.pop(k, None)
+        # Compute the authoritative remaining count FIRST (this reads _sessions_lock
+        # and releases it before we take _offline_alert_lock below — never nested).
+        # We cooldown per (license_key, remaining) so every distinct offline transition
+        # (2→1→0 remaining) fires once, but a flapping sid can't spam the same one.
         try:
             remaining = len(license_sids(license_key) or [])
         except Exception:
             remaining = 0
+        cooldown_key = (license_key, remaining)
+        now = time.monotonic()
+        with _offline_alert_lock:
+            if now - _offline_alert_last.get(cooldown_key, 0.0) < OFFLINE_ALERT_COOLDOWN_S:
+                return
+            _offline_alert_last[cooldown_key] = now
+            if len(_offline_alert_last) > 10000:      # opportunistic prune
+                cutoff = now - OFFLINE_ALERT_COOLDOWN_S
+                for k in [k for k, v in _offline_alert_last.items() if v < cutoff]:
+                    _offline_alert_last.pop(k, None)
+        # Full key here: this DM goes only to the admin, who owns the licenses and
+        # needs to know EXACTLY which one dropped (redact_key stays for user-facing paths).
         if remaining > 0:
             msg = (f"⚠️ <b>A userscript went offline</b>\n"
-                   f"🔑 <code>{redact_key(license_key)}</code>\n"
+                   f"🔑 <code>{safe_html(license_key)}</code>\n"
                    f"👤 {safe_html(username or '-')}\n"
                    f"🟢 {remaining} still online\n"
                    f"🕐 {_now_ist()}")
         else:
             msg = (f"⚠️ <b>ALL userscripts OFFLINE</b>\n"
-                   f"🔑 <code>{redact_key(license_key)}</code>\n"
+                   f"🔑 <code>{safe_html(license_key)}</code>\n"
                    f"👤 {safe_html(username or '-')}\n"
                    f"Turn one on ASAP!\n"
                    f"🕐 {_now_ist()}")
@@ -2164,6 +2172,73 @@ def collect_send_browsers(license_key: str, wait_seconds: float = 5.0) -> dict:
     return {
         'browsers': total_browsers or len(items),
         'accounts': list(accounts.values()),
+    }
+
+
+def collect_all_connected(wait_seconds: float = 5.0) -> dict:
+    """Admin overview: every connected license, its live userscript count, and the
+    per-userscript token counts — WITHOUT the username dedup, so multiple userscripts
+    on the same license (even same username) are each listed.
+
+    Reuses the getBrowsers/sendBrowsers path: reset every connected license's collector,
+    emit getBrowsers to all, then a SINGLE bounded sleep for all licenses at once, then
+    read the raw replies. Best-effort (a concurrent collect_send_browsers on the same
+    license may split replies). Never blocks a hot path; locks are held one-at-a-time
+    (never nested), so no deadlock."""
+    keys = connected_account_keys()
+    if not keys:
+        return {'licenses': [], 'totals': {'licenses': 0, 'userscripts': 0}}
+
+    # Reset + emit for every license, THEN sleep once (one 5s window for all).
+    delivered_any = False
+    for k in keys:
+        with _collectors_lock:
+            _browsers_collectors[k] = []
+        if emit_get_browsers(k) > 0:
+            delivered_any = True
+    if delivered_any:
+        import eventlet
+        eventlet.sleep(wait_seconds)
+
+    licenses = []
+    total_userscripts = 0
+    for k in keys:
+        with _collectors_lock:
+            items = list(_browsers_collectors.get(k, []))
+            _browsers_collectors[k] = []
+        userscripts = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            acct = None
+            accts = item.get('accounts')
+            if isinstance(accts, list) and accts and isinstance(accts[0], dict):
+                acct = accts[0]
+            username = (acct or {}).get('username') or item.get('username') or '?'
+            tokens = item.get('tokens')
+            if tokens is None and acct is not None:
+                tokens = acct.get('tokens')
+            # Defensive: one malformed reply must not blow up the whole overview.
+            try:
+                tokens = int(tokens or 0)
+            except (TypeError, ValueError):
+                tokens = 0
+            claims24h = (acct or {}).get('claims24h')
+            userscripts.append({
+                'username': username,
+                'tokens': tokens,
+                'claims24h': claims24h,
+            })
+        connected = len(license_sids(k) or [])
+        total_userscripts += connected
+        licenses.append({
+            'license_key': k,
+            'connected': connected,
+            'userscripts': userscripts,
+        })
+    return {
+        'licenses': licenses,
+        'totals': {'licenses': len(licenses), 'userscripts': total_userscripts},
     }
 
 
