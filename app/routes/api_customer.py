@@ -186,12 +186,25 @@ def _pick_free(session, now, exclude_order_id=None, prefer=None):
             resd = _reserved_indexes(session, a.id, now, exclude_order_id)
             if pidx not in used and pidx not in resd:
                 return a, pidx
+    # Balanced (least-loaded) allocation: spread slots EVENLY across the connected
+    # userscripts instead of filling account #1 before touching #2, so no single
+    # userscript is pressured (each ends up making ~7×(its slots) tokens evenly).
+    # Pick the account with the fewest occupied+reserved slots; tie-break by lowest id
+    # (deterministic/stable). The free index is found by SCANNING range(max_slots) so a
+    # legacy slot whose index ≥ a since-reduced max_slots can't falsely mark it full.
+    best = None   # (load, account, free_idx)
     for a in accts:
         used = _occupied_indexes(session, a.id, now)
         resd = _reserved_indexes(session, a.id, now, exclude_order_id)
-        for idx in range(int(a.max_slots or 0)):
-            if idx not in used and idx not in resd:
-                return a, idx
+        taken = used | resd
+        free_idx = next((i for i in range(int(a.max_slots or 0)) if i not in taken), None)
+        if free_idx is None:
+            continue   # account full → skip
+        load = len(taken)
+        if best is None or load < best[0] or (load == best[0] and a.id < best[1].id):
+            best = (load, a, free_idx)
+    if best is not None:
+        return best[1], best[2]
     return None, None
 
 
