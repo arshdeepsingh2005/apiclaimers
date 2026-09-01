@@ -954,6 +954,66 @@ def tmc_disconnect():
     )
 
 
+# ---------------------------------------------------------------------------
+# Queue-overload deferral (API-Claimer). A userscript that replies "Token queue
+# overloaded" had a LOCAL empty token pool — it never reached Stake, so this is
+# NOT a claim outcome and must not pollute Recent Claims. On a drop, redundant
+# RDPs of the SAME license each reply for a slot; when one reports queue-overload
+# we HOLD it for QO_DEFER_S seconds and prefer the REAL reply from any other RDP
+# (a success or a genuine Stake failure). Only if NO real reply arrives in the
+# window do we record a clean 'queue_overload' as the fallback. Real replies are
+# recorded IMMEDIATELY (unchanged) — only the queue-overload path is deferred, so
+# a genuine claim is never delayed or dropped.
+# ---------------------------------------------------------------------------
+QO_DEFER_S = float(os.environ.get('QO_DEFER_S', '5'))
+_pending_qo = {}                         # (account_id, slot_id, code_norm) -> generation int
+_pending_qo_lock = threading.Lock()
+_qo_gen = 0
+
+
+def _is_queue_overloaded(claimed, error_code) -> bool:
+    """A LOCAL 'Token queue overloaded' reply — not a Stake outcome."""
+    return (not claimed) and bool(error_code) and 'queue overloaded' in str(error_code).lower()
+
+
+def _record_claim_qo_aware(account_id, slot_id, code_norm, *, claimed, error_code,
+                           currency=None, amount=None, slot_username=None,
+                           telegram_id=None, claim_type=None) -> None:
+    """Record a claim, DEFERRING a local queue-overload so a real reply from another
+    RDP wins. Real replies record immediately; see the block comment above."""
+    from app.routes.api_slots import record_api_claim
+    key = (int(account_id), int(slot_id), str(code_norm))
+    if _is_queue_overloaded(claimed, error_code):
+        global _qo_gen
+        with _pending_qo_lock:
+            _qo_gen += 1
+            gen = _qo_gen
+            _pending_qo[key] = gen
+
+        def _flush():
+            with _pending_qo_lock:
+                if _pending_qo.get(key) != gen:
+                    return                       # superseded by a real reply (or newer QO)
+                _pending_qo.pop(key, None)
+            try:
+                record_api_claim(account_id, slot_id, code_norm, claimed=False,
+                                 error_code='queue_overload', currency=currency, amount=None,
+                                 slot_username=slot_username, telegram_id=telegram_id,
+                                 claim_type=claim_type)
+            except Exception:
+                logger.exception("queue_overload fallback record failed (ignored)")
+
+        import eventlet
+        eventlet.spawn_after(QO_DEFER_S, _flush)
+        return
+    # REAL reply — supersede any pending queue-overload for this slot+code, record now.
+    with _pending_qo_lock:
+        _pending_qo.pop(key, None)
+    record_api_claim(account_id, slot_id, code_norm, claimed=claimed, error_code=error_code,
+                     currency=currency, amount=amount, slot_username=slot_username,
+                     telegram_id=telegram_id, claim_type=claim_type)
+
+
 @socketio.on('userClaim', namespace=TMC_NS)
 def on_user_claim(data):
     """
@@ -1086,11 +1146,10 @@ def on_user_claim(data):
             if _rec_code:
                 try:
                     from app.license_manager import get_license_cache_entry
-                    from app.routes.api_slots import record_api_claim
                     _e = get_license_cache_entry(license_key) or {}
                     _acct_id = _e.get('account_id')
                     if _acct_id:
-                        record_api_claim(
+                        _record_claim_qo_aware(
                             int(_acct_id), slot_id, _rec_code,
                             claimed=claimed, error_code=(error_code or None),
                             currency=currency, amount=amount, slot_username=username,
